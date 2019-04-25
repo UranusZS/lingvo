@@ -18,10 +18,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import numpy as np
 from six.moves import zip
-
 import tensorflow as tf
 
+from lingvo.core import plot
 from lingvo.core import py_utils
 from lingvo.core import scorers
 try:
@@ -271,13 +272,24 @@ class AUCMetric(BaseMetric):
       ImportError: If user has installed sklearn, raise an ImportError.
     """
     if not HAS_SKLEARN:
-      raise ImportError('AUC metrics depends on sklearn.')
+      raise ImportError('AUCMetric depends on sklearn.')
     self._mode = mode
     self._samples = samples
     self._label = []
     self._prob = []
+    self._weight = []
+    if self._mode == 'roc':
+      self._curve_fn = sklearn.metrics.roc_curve
+      self._score_fn = sklearn.metrics.roc_auc_score
+      self._plot_labels = ['False Positive Rate', 'True Positive Rate']
+    elif self._mode == 'pr':
+      self._curve_fn = sklearn.metrics.precision_recall_curve
+      self._score_fn = sklearn.metrics.average_precision_score
+      self._plot_labels = ['Recall', 'Precision']
+    else:
+      raise ValueError('mode in AUCMetric must be one of "roc" or "pr".')
 
-  def Update(self, label, prob):
+  def Update(self, label, prob, weight=None):
     """Updates the metrics.
 
     Args:
@@ -285,16 +297,41 @@ class AUCMetric(BaseMetric):
         either 0 or 1.
       prob: An array to specify the prediction probabilities. Values must be
         within [0, 1.0].
+      weight: An array to specify the sample weight for the auc computation.
     """
     self._label += label
     self._prob += prob
+    if weight:
+      self._weight += weight
+    else:
+      self._weight += [1 for _ in range(len(label))]
+
     if self._samples > 0:
       self._label = self._label[-self._samples:]
       self._prob = self._prob[-self._samples:]
+      self._weight = self._weight[-self._samples:]
 
   @property
   def value(self):
-    if self._mode == 'roc':
-      return sklearn.metrics.roc_auc_score(self._label, self._prob)
-    else:
-      return sklearn.metrics.average_precision_score(self._label, self._prob)
+    return self._score_fn(self._label, self._prob, sample_weight=self._weight)
+
+  def Summary(self, name):
+
+    def _Setter(fig, axes):
+      # 20 ticks betweein 0 and 1.
+      ticks = np.arange(0, 1.05, 0.05)
+      axes.grid(b=True)
+      axes.set_xlabel(self._plot_labels[0])
+      axes.set_xticks(ticks)
+      axes.set_ylabel(self._plot_labels[1])
+      axes.set_yticks(ticks)
+      fig.tight_layout()
+
+    xs, ys, _ = self._curve_fn(
+        self._label, self._prob, sample_weight=self._weight)
+    if self._mode == 'pr':
+      # Swap because sklearn returns <'precision', 'recall'>.
+      xs, ys = ys, xs
+    ret = plot.Curve(name=name, figsize=(12, 12), xs=xs, ys=ys, setter=_Setter)
+    ret.value.add(tag=name, simple_value=self.value)
+    return ret

@@ -211,6 +211,27 @@ class ExponentialLearningRateSchedule(BaseLearningRateSchedule):
     return self._exp(tf.cast(current_step, dtype=self.params.dtype))
 
 
+class StepwiseExponentialSchedule(BaseLearningRateSchedule):
+  """Exponential decay every N steps."""
+
+  @classmethod
+  def Params(cls):
+    p = super(StepwiseExponentialSchedule, cls).Params()
+    p.Define('decay', 0.99, 'Decay factor.')
+    p.Define('num_steps_per_decay', 1000, 'Number of steps between decays.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(StepwiseExponentialSchedule, self).__init__(params)
+
+  def FProp(self, theta, current_step):
+    p = self.params
+    num_decays = tf.floor(
+        tf.div(tf.cast(current_step, tf.float32), float(p.num_steps_per_decay)))
+    return tf.pow(p.decay, num_decays)
+
+
 class CombinedMinimumLearningRateSchedule(BaseLearningRateSchedule):
   """Combine a few learning rate decay schedules and takes the min."""
 
@@ -572,23 +593,28 @@ class CosineSchedule(BaseLearningRateSchedule):
   is implemented here.
 
   where:
-    angle = pi * current_step / total_steps
-    value = initial_value * (1 + cosine(angle)) / 2
+    angle = pi * min(1, current_step / total_steps)
+    decay_gap = initial_value - final_value
+    value = final_value + decay_gap * (1 + cosine(angle)) / 2
   """
 
   @classmethod
   def Params(cls):
     p = super(CosineSchedule, cls).Params()
     p.Define('initial_value', 1.0, 'Initial decay value.')
+    p.Define('final_value', 0., 'Final decay value.')
     p.Define('total_steps', 0, 'Number of steps to reach full decay.')
     return p
 
   def FProp(self, theta, current_step):
     p = self.params
     assert p.total_steps > 0
+    assert p.initial_value > p.final_value
     with tf.name_scope(p.name):
-      return 0.5 * p.initial_value * (1 + tf.cos(
-          math.pi * tf.cast(current_step, tf.float32) / p.total_steps))
+      decay_gap = p.initial_value - p.final_value
+      return p.final_value + 0.5 * decay_gap * (1 + tf.cos(math.pi * tf.minimum(
+          1.0,
+          tf.cast(current_step, tf.float32) / p.total_steps)))
 
 
 class PiecewiseSchedule(BaseLearningRateSchedule):

@@ -81,6 +81,11 @@ class RNNCell(quant_utils.QuantizableLayer):
          'inputs are packed into a single training example. The RNN layer '
          'should provide reset_mask inputs in addition to act and padding if '
          'this flag is set.'))
+    p.Define(
+        'zero_state_init_params', py_utils.DefaultRNNCellStateInit(),
+        'Parameters that define how the initial state values are set '
+        'for each cell. Must be one of the static functions defined in '
+        'py_utils.RNNCellStateInit.')
     return p
 
   @base_layer.initializer
@@ -314,6 +319,7 @@ class LSTMCellSimple(RNNCell):
           init=p.params_init,
           dtype=p.dtype,
           collections=self._VariableCollections())
+      self.CreateVariable('wm', wm_pc, self.AddGlobalVN)
       if p.apply_pruning:
         mask_pc = py_utils.WeightParams(wm_pc.shape,
                                         py_utils.WeightInit.Constant(1.0),
@@ -325,16 +331,8 @@ class LSTMCellSimple(RNNCell):
         self.CreateVariable(
             'threshold', threshold_pc, theta_fn=None, trainable=False)
 
-        def MaskWeightFn(weight):
-          return tf.multiply(
-              self.AddGlobalVN(weight), self.vars.mask, 'masked_weights')
-
-        self.CreateVariable('wm', wm_pc, theta_fn=MaskWeightFn)
         py_utils.AddToPruningCollections(self.vars.wm, self.vars.mask,
                                          self.vars.threshold)
-
-      else:
-        self.CreateVariable('wm', wm_pc, self.AddGlobalVN)
 
       if p.num_hidden_nodes:
         w_proj = py_utils.WeightParams(
@@ -384,10 +382,12 @@ class LSTMCellSimple(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, self.output_size),
-                      dtype=py_utils.FPropDtype(p))
-    zero_c = tf.zeros((batch_size, self.hidden_size),
-                      dtype=py_utils.FPropDtype(p))
+    zero_m = py_utils.InitRNNCellState((batch_size, self.output_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
+    zero_c = py_utils.InitRNNCellState((batch_size, self.hidden_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
     if p.is_inference:
       zero_m = self.QTensor('zero_m', zero_m)
       zero_c = self.QTensor('zero_c', zero_c)
@@ -441,7 +441,10 @@ class LSTMCellSimple(RNNCell):
 
   def _Mix(self, theta, state0, inputs):
     assert isinstance(inputs.act, list)
-    wm = self.QWeight(theta.wm)
+    if self.params.apply_pruning:
+      wm = self.QWeight(tf.multiply(theta.wm, theta.mask, 'masked_weights'))
+    else:
+      wm = self.QWeight(theta.wm)
     concat = tf.concat(inputs.act + [state0.m], 1)
     # Defer quantization until after adding in the bias to support fusing
     # matmul and bias add during inference.
@@ -850,10 +853,12 @@ class QuantizedLSTMCell(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, p.num_output_nodes),
-                      dtype=py_utils.FPropDtype(p))
-    zero_c = tf.zeros((batch_size, p.num_output_nodes),
-                      dtype=py_utils.FPropDtype(p))
+    zero_m = py_utils.InitRNNCellState((batch_size, p.num_output_nodes),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
+    zero_c = py_utils.InitRNNCellState((batch_size, p.num_output_nodes),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
     return py_utils.NestedMap(m=zero_m, c=zero_c)
 
   def GetOutput(self, state):
@@ -948,8 +953,12 @@ class LSTMCellCuDNNCompliant(RNNCell):
   def zero_state(self, batch_size):
     p = self._params
     return py_utils.NestedMap(
-        m=tf.zeros([batch_size, p.num_output_nodes], dtype=p.dtype),
-        c=tf.zeros([batch_size, p.num_output_nodes], dtype=p.dtype))
+        m=py_utils.InitRNNCellState([batch_size, p.num_output_nodes],
+                                    init=p.zero_state_init_params,
+                                    dtype=p.dtype),
+        c=py_utils.InitRNNCellState([batch_size, p.num_output_nodes],
+                                    init=p.zero_state_init_params,
+                                    dtype=p.dtype))
 
   def GetOutput(self, state):
     return state.m
@@ -1092,10 +1101,14 @@ class LayerNormalizedLSTMCell(RNNCell):
     return self.params.num_output_nodes
 
   def zero_state(self, batch_size):
-    params = self.params
+    p = self.params
     return py_utils.NestedMap(
-        m=tf.zeros([batch_size, params.num_output_nodes], dtype=params.dtype),
-        c=tf.zeros([batch_size, params.num_output_nodes], dtype=params.dtype))
+        m=py_utils.InitRNNCellState([batch_size, p.num_output_nodes],
+                                    init=p.zero_state_init_params,
+                                    dtype=p.dtype),
+        c=py_utils.InitRNNCellState([batch_size, p.num_output_nodes],
+                                    init=p.zero_state_init_params,
+                                    dtype=p.dtype))
 
   def GetOutput(self, state):
     return state.m
@@ -1154,7 +1167,7 @@ class LayerNormalizedLSTMCell(RNNCell):
 
     # Clip the cell states to reasonable value.
     if params.cc_schedule:
-      cap = self.cc_schedule.CurrentCap(theta.cc_schedule)
+      cap = self.cc_schedule.GetState(theta.cc_schedule)
     else:
       cap = params.cell_value_cap
     new_c = py_utils.clip_by_value(new_c, -cap, cap)
@@ -1357,10 +1370,12 @@ class LayerNormalizedLSTMCellLean(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, self.output_size),
-                      dtype=py_utils.FPropDtype(p))
-    zero_c = tf.zeros((batch_size, self.hidden_size),
-                      dtype=py_utils.FPropDtype(p))
+    zero_m = py_utils.InitRNNCellState((batch_size, self.output_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
+    zero_c = py_utils.InitRNNCellState((batch_size, self.hidden_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
     return py_utils.NestedMap(m=zero_m, c=zero_c)
 
   def _ResetState(self, state, inputs):
@@ -1376,13 +1391,13 @@ class LayerNormalizedLSTMCellLean(RNNCell):
     mixed = tf.matmul(tf.concat(inputs.act + [state0.m], 1), theta.wm)
     return mixed
 
-  def _LayerNorm(self, x, scale, bias):
+  def _LayerNormGate(self, theta, gate_name, x):
     """Applies layer normalization on the last dimension of 'x'.
 
     Args:
+      theta: a NestedMap of layer params.
+      gate_name: the name of the gate, e.g., 'i_i', 'f_g', 'c', etc.
       x: activation tensor, where the last dimension represents channels.
-      scale: multiples to the noramlized results
-      bias: additions to the noramlized results for biasing
 
     Returns:
       Layer normalized 'x', with the same shape as the input.
@@ -1392,18 +1407,20 @@ class LayerNormalizedLSTMCellLean(RNNCell):
     centered = x - mean
     variance = tf.reduce_mean(tf.square(centered), axis=[1], keepdims=True)
     normed = centered * tf.rsqrt(variance + p.layer_norm_epsilon)
+    scale = theta['ln_scale_%s' % gate_name] + 1.0
+    bias = theta['bias_%s' % gate_name]
     return normed * scale + bias
 
   def _Gates(self, xmw, theta, state0, inputs):
     """Compute the new state."""
     p = self.params
     i_i, i_g, f_g, o_g = tf.split(value=xmw, num_or_size_splits=4, axis=1)
-    i_i = self._LayerNorm(i_i, theta.ln_scale_i_i + 1.0, theta.bias_i_i)
-    i_g = self._LayerNorm(i_g, theta.ln_scale_i_g + 1.0, theta.bias_i_g)
-    f_g = self._LayerNorm(f_g, theta.ln_scale_f_g + 1.0, theta.bias_f_g)
-    o_g = self._LayerNorm(o_g, theta.ln_scale_o_g + 1.0, theta.bias_o_g)
+    i_i = self._LayerNormGate(theta, 'i_i', i_i)
+    i_g = self._LayerNormGate(theta, 'i_g', i_g)
+    f_g = self._LayerNormGate(theta, 'f_g', f_g)
+    o_g = self._LayerNormGate(theta, 'o_g', o_g)
     new_c = tf.sigmoid(f_g) * state0.c + tf.sigmoid(i_g) * tf.tanh(i_i)
-    new_c_normed = self._LayerNorm(new_c, theta.ln_scale_c + 1.0, theta.bias_c)
+    new_c_normed = self._LayerNormGate(theta, 'c', new_c)
     new_m = tf.sigmoid(o_g) * tf.tanh(new_c_normed)
 
     if p.num_hidden_nodes:
@@ -1516,10 +1533,12 @@ class DoubleProjectionLSTMCell(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, self.output_size),
-                      dtype=py_utils.FPropDtype(p))
-    zero_c = tf.zeros((batch_size, self.hidden_size),
-                      dtype=py_utils.FPropDtype(p))
+    zero_m = py_utils.InitRNNCellState((batch_size, self.output_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
+    zero_c = py_utils.InitRNNCellState((batch_size, self.hidden_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
     return py_utils.NestedMap(m=zero_m, c=zero_c)
 
   def _ResetState(self, state, inputs):
@@ -1667,10 +1686,14 @@ class ConvLSTMCell(RNNCell):
     width = p.inputs_shape[2]
     out_channels = p.cell_shape[3]
     return py_utils.NestedMap(
-        m=tf.zeros(
-            tf.stack([batch_size, height, width, out_channels]), dtype=p.dtype),
-        c=tf.zeros(
-            tf.stack([batch_size, height, width, out_channels]), dtype=p.dtype))
+        m=py_utils.InitRNNCellState(
+            tf.stack([batch_size, height, width, out_channels]),
+            init=p.zero_state_init_params,
+            dtype=p.dtype),
+        c=py_utils.InitRNNCellState(
+            tf.stack([batch_size, height, width, out_channels]),
+            init=p.zero_state_init_params,
+            dtype=p.dtype))
 
   def GetOutput(self, state):
     return state.m
@@ -1856,10 +1879,12 @@ class SRUCell(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, self.output_size),
-                      dtype=py_utils.FPropDtype(p))
-    zero_c = tf.zeros((batch_size, self.hidden_size),
-                      dtype=py_utils.FPropDtype(p))
+    zero_m = py_utils.InitRNNCellState((batch_size, self.output_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
+    zero_c = py_utils.InitRNNCellState((batch_size, self.hidden_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
     return py_utils.NestedMap(m=zero_m, c=zero_c)
 
   def GetOutput(self, state):
@@ -2006,8 +2031,12 @@ class QRNNPoolingCell(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, p.num_output_nodes), dtype=p.dtype)
-    zero_c = tf.zeros((batch_size, p.num_output_nodes), dtype=p.dtype)
+    zero_m = py_utils.InitRNNCellState((batch_size, p.num_output_nodes),
+                                       init=p.zero_state_init_params,
+                                       dtype=p.dtype)
+    zero_c = py_utils.InitRNNCellState((batch_size, p.num_output_nodes),
+                                       init=p.zero_state_init_params,
+                                       dtype=p.dtype)
     return py_utils.NestedMap(m=zero_m, c=zero_c)
 
   def GetOutput(self, state):
@@ -2197,10 +2226,12 @@ class GRUCell(RNNCell):
 
   def zero_state(self, batch_size):
     p = self.params
-    zero_m = tf.zeros((batch_size, self.output_size),
-                      dtype=py_utils.FPropDtype(p))
-    zero_c = tf.zeros((batch_size, self.hidden_size),
-                      dtype=py_utils.FPropDtype(p))
+    zero_m = py_utils.InitRNNCellState((batch_size, self.output_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
+    zero_c = py_utils.InitRNNCellState((batch_size, self.hidden_size),
+                                       init=p.zero_state_init_params,
+                                       dtype=py_utils.FPropDtype(p))
     return py_utils.NestedMap(m=zero_m, c=zero_c)
 
   def _ResetState(self, state, inputs):

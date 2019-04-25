@@ -20,19 +20,21 @@ from __future__ import print_function
 
 import math
 
+from absl.testing import parameterized
 import numpy as np
 from six.moves import range
 from six.moves import zip
 import tensorflow as tf
 
 from tensorflow.python.framework import ops
+from lingvo.core import gpipe
 from lingvo.core import layers
 from lingvo.core import py_utils
 from lingvo.core import quant_utils
 from lingvo.core import test_utils
 
 
-class ActivationsTest(tf.test.TestCase):
+class ActivationsTest(test_utils.TestCase):
 
   def testGeluActivation(self):
     with self.session(use_gpu=True):
@@ -67,7 +69,7 @@ class ActivationsTest(tf.test.TestCase):
       self.assertAllClose(expected_grads_gelu, actual_grads_gelu)
 
 
-class BatchNormLayerTest(tf.test.TestCase):
+class BatchNormLayerTest(test_utils.TestCase):
 
   def testBatchNormLayerConstruction(self):
     with self.session(use_gpu=True):
@@ -219,7 +221,7 @@ class BatchNormLayerTest(tf.test.TestCase):
       self.assertAllClose(2039.398681, sig2.eval())
 
 
-class ConvLayerTest(tf.test.TestCase):
+class ConvLayerTest(test_utils.TestCase):
   """Tests conv layers.
 
   Note that there are multiple subclasses of BaseConv2DLayer and most cases
@@ -1213,7 +1215,7 @@ class ConvLayerTest(tf.test.TestCase):
   # TODO(yonghui): more test for convolution layer
 
 
-class PoolingLayerTest(tf.test.TestCase):
+class PoolingLayerTest(test_utils.TestCase):
 
   def testPoolLayerFProp(self):
     with self.session(use_gpu=True):
@@ -1285,7 +1287,7 @@ class PoolingLayerTest(tf.test.TestCase):
         self.assertAllClose(predicted_out_shape, output1_v.shape)
 
 
-class ProjectionLayerTest(tf.test.TestCase):
+class ProjectionLayerTest(test_utils.TestCase):
 
   def testProjectionLayerConstruction(self):
     with self.session(use_gpu=True):
@@ -1344,8 +1346,8 @@ class ProjectionLayerTest(tf.test.TestCase):
       if quantized:
         cc_schedule = quant_utils.FakeQuantizationSchedule.Params().Set(
             clip_end_step=1, quant_start_step=1)
-        qdomain_default = quant_utils.SymetricScheduledClipQDomain.Params().Set(
-            cc_schedule=cc_schedule.Copy())
+        qdomain_default = quant_utils.SymmetricScheduledClipQDomain.Params(
+        ).Set(cc_schedule=cc_schedule.Copy())
         params.qdomain.default = qdomain_default.Copy()
       params.is_eval = is_eval
 
@@ -1366,7 +1368,7 @@ class ProjectionLayerTest(tf.test.TestCase):
       tf.global_variables_initializer().run()
       if quantized:
         # Put it in the fully quantized range.
-        sess.run([proj_layer.PostTrainingStepUpdate(5)])
+        sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 5))
       return output.eval()
 
   def testProjectionLayerFProp(self):
@@ -1736,7 +1738,7 @@ class ProjectionLayerTest(tf.test.TestCase):
         self.assertAllClose(sg, ng, rtol=1e-06, atol=1e-06)
 
 
-class EmbeddingLayerTest(tf.test.TestCase):
+class EmbeddingLayerTest(test_utils.TestCase):
 
   def testEmbeddingLayer(self):
     with self.session(use_gpu=True):
@@ -2145,7 +2147,7 @@ class EmbeddingLayerTest(tf.test.TestCase):
                           actual_position_embs)
 
 
-class SoftmaxLayerTest(tf.test.TestCase):
+class SoftmaxLayerTest(test_utils.TestCase):
 
   def _RunSimpleFullSoftmax(self,
                             num_shards=1,
@@ -2222,9 +2224,7 @@ class SoftmaxLayerTest(tf.test.TestCase):
 
       tf.global_variables_initializer().run()
       if training_step >= 0:
-        step_op = softmax.PostTrainingStepUpdate(training_step)
-        if step_op:
-          sess.run([step_op])
+        sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), training_step))
       return sess.run(xent_loss)
 
   def testSimpleFullSoftmaxMasked(self):
@@ -2479,7 +2479,7 @@ class SoftmaxLayerTest(tf.test.TestCase):
       self.assertNear(log_perplexity, 3.46426, 1e-4)
 
   def testSimpleFullSoftmax_FakeQuantized(self):
-    default_qdomain = quant_utils.SymetricScheduledClipQDomain.Params()
+    default_qdomain = quant_utils.SymmetricScheduledClipQDomain.Params()
     default_qdomain.cc_schedule = quant_utils.FakeQuantizationSchedule.Params(
     ).Set(
         clip_start_step=0, clip_end_step=2, quant_start_step=2)
@@ -2540,7 +2540,7 @@ class SoftmaxLayerTest(tf.test.TestCase):
     self._RunSimpleFullSoftmaxGradientChecker(3, 4, 5, 2)
 
 
-class SoftmaxLayerLogitsTest(tf.test.TestCase):
+class SoftmaxLayerLogitsTest(test_utils.TestCase):
   """Testing SoftmaxLayer.Logits()."""
 
   def _Logits(self, params, batch_size=2, seq_length=None):
@@ -2590,7 +2590,7 @@ class SoftmaxLayerLogitsTest(tf.test.TestCase):
     self.assertAllClose(6.9934864, np.sum(logits))
 
 
-class FeedForwardNetTest(tf.test.TestCase):
+class FeedForwardNetTest(test_utils.TestCase):
 
   def testFeedForwardNetConstruction(self):
     with self.session(use_gpu=False):
@@ -2688,7 +2688,7 @@ class FeedForwardNetTest(tf.test.TestCase):
           quant_start_step=2,
           start_cap=8.0,
           end_cap=2.0)
-      proj_qdomain = quant_utils.SymetricScheduledClipQDomain.Params().Set(
+      proj_qdomain = quant_utils.SymmetricScheduledClipQDomain.Params().Set(
           cc_schedule=cc_schedule)
 
       p = layers.FeedForwardNet.Params().Set(
@@ -2728,11 +2728,7 @@ class FeedForwardNetTest(tf.test.TestCase):
 
       tf.global_variables_initializer().run()
 
-      sess.run([
-          feedforward_net.PostTrainingStepUpdate(5),
-          p1_l.PostTrainingStepUpdate(5),
-          p2_l.PostTrainingStepUpdate(5)
-      ])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 5))
       out1_v, out2_v = sess.run([out1, out2])
       self.assertAllClose(out1_v, out2_v)
 
@@ -2838,7 +2834,204 @@ class FeedForwardNetTest(tf.test.TestCase):
       self.assertAllEqual(xd, x)
 
 
-class LayerNormTest(tf.test.TestCase):
+class AddingAccumulatorTest(test_utils.TestCase):
+  """Test for AddingAccumulator."""
+
+  def testAddingAccumulator(self):
+    with self.session():
+      layer_p = layers.IdentityLayer.Params()
+      layer_p.name = 'test'
+      layer = layer_p.cls(layer_p)
+
+      layer.RegisterAccumulator('acc1', layers.AddingAccumulator([],
+                                                                 tf.float32))
+
+      # Initial value.
+      self.assertEqual(0.0, layer.accumulators.acc1.GetValue().eval())
+
+      # Update/merge.
+      layer.accumulators.acc1.Update(1.0)
+      layer.accumulators.acc1.Update(1.0)
+      self.assertEqual(2.0, layer.accumulators.acc1.GetValue().eval())
+
+      # Reset.
+      layer.accumulators.Transform(lambda acc: acc.Reset())
+      self.assertEqual(0.0, layer.accumulators.acc1.GetValue().eval())
+
+
+class BatchNormLayerNoPaddingTest(test_utils.TestCase, parameterized.TestCase):
+
+  def testBatchNormLayerNoPaddingConstruction(self):
+    tf.set_random_seed(398847392)
+    np.random.seed(12345)
+    params = layers.BatchNormLayerNoPadding.Params()
+    params.name = 'bn'
+    params.dim = 2
+    params.params_init = py_utils.WeightInit.Gaussian(0.1)
+    params.is_eval = False
+    layers.BatchNormLayerNoPadding(params)
+    bn_vars = tf.get_collection('BatchNormLayerNoPadding_vars')
+    bn_var_names = [x.name for x in bn_vars]
+    expected_var_names = [
+        'bn/beta/var:0', 'bn/gamma/var:0', 'bn/moving_mean/var:0',
+        'bn/moving_variance/var:0'
+    ]
+    self.assertEqual(expected_var_names, bn_var_names)
+
+  @parameterized.named_parameters({
+      'testcase_name': '_eval',
+      'is_eval': True,
+  }, {
+      'testcase_name': '_train',
+      'is_eval': False,
+  })
+  def testBatchNormLayerNoPaddingFProp(self, is_eval):
+    tf.set_random_seed(398847392)
+    np.random.seed(12345)
+    params = layers.BatchNormLayerNoPadding.Params()
+    params.name = 'bn'
+    params.dim = 3
+    params.params_init = py_utils.WeightInit.Gaussian(0.1)
+    params.is_eval = is_eval
+
+    bn_layer = layers.BatchNormLayerNoPadding(params)
+    bn_in1 = tf.constant(
+        np.random.normal(0.1, 0.5, [2, 8, 3]), dtype=tf.float32)
+
+    bn_out = bn_layer.FPropDefaultTheta(bn_in1)
+    sig1 = tf.reduce_sum(bn_out)
+    sig2 = tf.reduce_sum(bn_out * bn_out)
+    expected_sig1 = 2.6593573 if is_eval else 0
+    expected_sig2 = 15.4642076 if is_eval else 47.850193
+    with self.session(use_gpu=True):
+      tf.global_variables_initializer().run()
+      self.assertAllClose(expected_sig1, sig1.eval(), atol=1e-5)
+      self.assertAllClose(expected_sig2, sig2.eval(), atol=1e-5)
+
+  def testBatchNormLayerNoPaddingFPropUseGlobalStatsForTraining(self):
+    tf.set_random_seed(398847392)
+    np.random.seed(12345)
+    params = layers.BatchNormLayerNoPadding.Params()
+    params.name = 'bn'
+    params.dim = 3
+    params.params_init = py_utils.WeightInit.Gaussian(0.1)
+    params.is_eval = False
+
+    bn_layer = layers.BatchNormLayerNoPadding(params)
+    bn_in1 = tf.constant(
+        np.random.normal(0.1, 0.5, [2, 8, 3]), dtype=tf.float32)
+
+    bn_out = bn_layer.FPropDefaultTheta(bn_in1)
+    sig1 = tf.reduce_sum(bn_out)
+    sig2 = tf.reduce_sum(bn_out * bn_out)
+    with self.session(use_gpu=True):
+      tf.global_variables_initializer().run()
+      self.assertAllClose(1.19209289551e-06, sig1.eval(), atol=1e-5)
+      self.assertAllClose(47.8501930237, sig2.eval(), atol=1e-5)
+
+  def testBatchNormLayerNoPaddingFPropForConv(self):
+    tf.set_random_seed(398847392)
+    np.random.seed(12345)
+    params = layers.BatchNormLayerNoPadding.Params()
+    params.name = 'bn_conv'
+    params.dim = 32
+    params.params_init = py_utils.WeightInit.Gaussian(0.1)
+    params.is_eval = False
+
+    bn_layer = layers.BatchNormLayerNoPadding(params)
+    bn_in1 = tf.constant(
+        np.random.normal(0.1, 0.5, [2, 8, 4, 32]), dtype=tf.float32)
+
+    bn_out = bn_layer.FPropDefaultTheta(bn_in1)
+    sig1 = tf.reduce_sum(bn_out)
+    sig2 = tf.reduce_sum(bn_out * bn_out)
+    with self.session(use_gpu=True):
+      tf.global_variables_initializer().run()
+      self.assertAllClose(0.0, sig1.eval(), atol=1e-4)
+      self.assertAllClose(2039.398681, sig2.eval())
+
+  def _BuildDummyStackedBNLayer(self, splits):
+    num_micro_batches = 8
+    if splits == 0:
+      endpoint = layers.BatchNormLayerNoPadding.Params().Set(
+          decay=0.997, name='bn', dim=1)
+    else:
+      cell_tpl = []
+      for split in range(splits):
+        nets_to_split = [
+            layers.BatchNormLayerNoPadding.Params().Set(
+                decay=0.997, name='bn_{}'.format(split), dim=1),
+        ]
+        split_layer = gpipe.FeatureExtractionLayer.Params().Set(
+            name='split_{}'.format(split), sub=nets_to_split)
+        cell_tpl.append(split_layer)
+      endpoint = gpipe.PipeliningLayer.Params().Set(
+          name='pipeline',
+          num_micro_batches=num_micro_batches,
+          cell_tpl=cell_tpl,
+          before_tpl=[])
+    layer = endpoint.cls(endpoint)
+    return layer
+
+  @parameterized.named_parameters({
+      'testcase_name': '_baseline',
+      'splits': 0,
+  }, {
+      'testcase_name': '_two_splits',
+      'splits': 2,
+  }, {
+      'testcase_name': '_four_splits',
+      'splits': 4,
+  })
+  def testBatchNormLayerNoPaddingAccumulators(self, splits):
+    batch_size = 1024
+    with self.session(graph=tf.Graph()) as sess:
+      # Construct a network where loss = w * x + b
+      global_step = py_utils.GetGlobalStep()
+      inputs = tf.concat([
+          tf.ones([batch_size // 2, 1, 1, 1]),
+          tf.zeros([batch_size // 2, 1, 1, 1])
+      ],
+                         axis=0)
+      net = self._BuildDummyStackedBNLayer(splits)
+      logits = net.FPropDefaultTheta(inputs)
+      loss = tf.reduce_mean(logits)
+      grads = tf.gradients(loss, tf.trainable_variables())
+      # Check the accumulator values
+      counts = []
+      means = []
+      variances = []
+      for i in range(splits):
+        l = net.children['split_{}'.format(i)].children['bn_{}'.format(i)]
+        counts.append(l.accumulators.counts.GetValue())
+        means.append(l.accumulators.mean_ss.GetValue())
+        variances.append(l.accumulators.variance_ss.GetValue())
+      if splits == 0:
+        counts.append(net.accumulators.counts.GetValue())
+        means.append(net.accumulators.mean_ss.GetValue())
+        variances.append(net.accumulators.variance_ss.GetValue())
+      post_training_step_updates = net.PostTrainingStepUpdate(global_step)
+
+      sess.run(tf.global_variables_initializer())
+      _, count_vals, mean_vals, var_vals = sess.run(
+          [grads, counts, means, variances])
+
+      self.assertSameElements(count_vals, {batch_size})
+
+      self.assertEqual(batch_size // 2, mean_vals[0])
+      if len(mean_vals) > 1:
+        self.assertSameElements(mean_vals[1:], {0})
+
+      self.assertEqual(batch_size // 2, var_vals[0])
+      if len(var_vals) > 1:
+        self.assertSameElements(var_vals[1:], {0})
+      sess.run(post_training_step_updates)
+      moving_vars = sess.run(tf.get_collection('moving_vars'))
+    self.assertEqual(0.0015, moving_vars[0])
+    self.assertNear(0.997750, moving_vars[1], err=1.0e-6)
+
+
+class LayerNormTest(test_utils.TestCase):
 
   def testLayerNormFProp(self):
     with self.session(use_gpu=True) as sess:
@@ -2894,7 +3087,7 @@ class LayerNormTest(tf.test.TestCase):
         self.assertAllClose(sg, ng, rtol=1e-02, atol=1e-02)
 
 
-class DeterministicDropoutTest(tf.test.TestCase):
+class DeterministicDropoutTest(test_utils.TestCase, parameterized.TestCase):
 
   def testDeterministicDropoutLayer(self):
     params = layers.DeterministicDropoutLayer.Params().Set(keep_prob=0.7)
@@ -2910,7 +3103,7 @@ class DeterministicDropoutTest(tf.test.TestCase):
     ]) / 0.7
 
     with self.session():
-      tf.assign(py_utils.GetOrCreateGlobalStep(), 1234).eval()
+      tf.assign(py_utils.GetGlobalStep(), 1234).eval()
       py_utils.ResetStepSeed(seed=5678)
       x_val = dropout.FPropDefaultTheta(x).eval()
       self.assertAllClose(x_expected, x_val)
@@ -2921,26 +3114,108 @@ class DeterministicDropoutTest(tf.test.TestCase):
       self.assertNotAllClose(x_expected, x_val)
 
       # Different global step gives different result
-      tf.assign(py_utils.GetOrCreateGlobalStep(), 1235).eval()
+      tf.assign(py_utils.GetGlobalStep(), 1235).eval()
       py_utils.ResetStepSeed(seed=5678)
       x_val = dropout.FPropDefaultTheta(x).eval()
       self.assertNotAllClose(x_expected, x_val)
 
       # The same seeds in the same session is consistent.
-      tf.assign(py_utils.GetOrCreateGlobalStep(), 1234).eval()
+      tf.assign(py_utils.GetGlobalStep(), 1234).eval()
       py_utils.ResetStepSeed(seed=5678)
       x_val = dropout.FPropDefaultTheta(x).eval()
       self.assertAllClose(x_expected, x_val)
 
     # The same seeds in a different session is consistent.
     with self.session():
-      tf.assign(py_utils.GetOrCreateGlobalStep(), 1234).eval()
+      tf.assign(py_utils.GetGlobalStep(), 1234).eval()
       py_utils.ResetStepSeed(seed=5678)
       x_val = dropout.FPropDefaultTheta(x).eval()
       self.assertAllClose(x_expected, x_val)
 
+  def testNoiseShapeBroadcastDims(self):
+    params = layers.DeterministicDropoutLayer.Params().Set(
+        keep_prob=0.7, noise_shape_broadcast_dims=[-1])
+    params.name = 'drop'
+    dropout = layers.DeterministicDropoutLayer(params)
 
-class GradNormTrackerTest(tf.test.TestCase):
+    x = tf.ones([4, 6])
+    x_expected = np.array([
+        [1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0],
+    ]) / 0.7
+
+    with self.session():
+      tf.assign(py_utils.GetGlobalStep(), 1234).eval()
+      self.assertEqual(1234, dropout.theta.global_step.eval())
+      py_utils.ResetStepSeed(seed=5678)
+      x_val = dropout.FPropDefaultTheta(x).eval()
+      self.assertEqual(5679, py_utils.GetStepSeed().eval())
+    self.assertAllClose(x_expected, x_val)
+
+  @parameterized.named_parameters(
+      {
+          'testcase_name': 'baseline',
+          'splits': 1,
+          'num_micro_batches': 1
+      },
+      {
+          'testcase_name': 'OneSplitTwoMicroBatches',
+          'splits': 1,
+          'num_micro_batches': 2
+      },
+      {
+          'testcase_name': 'TwoSplitsOneMicroBatch',
+          'splits': 2,
+          'num_micro_batches': 1
+      },
+      {
+          'testcase_name': 'TwoSplitsTwoMicroBatches',
+          'splits': 2,
+          'num_micro_batches': 2
+      },
+  )
+  def testDropoutInRecurrent(self, splits=1, num_micro_batches=1):
+    """Test to verify the drop mask used in fprop and bprop is identical."""
+    assert splits in [1, 2, 4]
+    with self.session() as sess:
+      tf.set_random_seed(12345)
+      num_layers = 4
+      # Build a model with 4 dropout layers.
+      blocks = []
+      for l in range(num_layers):
+        blocks.append(layers.DeterministicDropoutLayer.Params().Set(
+            name='dropout_{}'.format(l), keep_prob=0.7))
+      # Divide the model into splits partitions.
+      cell_tpl = []
+      blocks_per_split = num_layers // splits
+      for i in range(splits):
+        sub = blocks[i * blocks_per_split:(i + 1) * blocks_per_split]
+        cell_tpl.append(gpipe.FeatureExtractionLayer.Params().Set(
+            name='cell_{}'.format(i), sub=sub))
+      # Parallelize partitions using pipeline.
+      p = gpipe.PipeliningLayer.Params().Set(
+          name='pipeline',
+          num_micro_batches=num_micro_batches,
+          cell_tpl=cell_tpl)
+      # Fake input
+      x = tf.ones([2, 3])
+      # Construct weights.
+      w = tf.get_variable(
+          'w', shape=[2, 3], initializer=tf.constant_initializer([[1] * 3] * 2))
+      mdl = p.cls(p)
+      y = mdl.FPropDefaultTheta(x * w)
+      # Construct loss function such that gradients = final activation.
+      loss = tf.reduce_sum(y)
+      grads = py_utils.ComputeGradients(loss, py_utils.NestedMap(w=w))
+      tf.global_variables_initializer().run()
+      y_val = sess.run(y)
+      grads_val = sess.run(grads)['w'][1]
+      self.assertAllClose(y_val, grads_val)
+
+
+class GradNormTrackerTest(test_utils.TestCase):
 
   def testGradNormTracker(self):
     with self.session(use_gpu=False) as sess:
@@ -3020,7 +3295,7 @@ class GradNormTrackerTest(tf.test.TestCase):
       self.assertEqual(total_rejections, 100)
 
 
-class HighwaySkipLayerTest(tf.test.TestCase):
+class HighwaySkipLayerTest(test_utils.TestCase):
 
   def testHighwaySkipLayerConstruction(self):
     with self.session(use_gpu=False):
@@ -3056,7 +3331,7 @@ class HighwaySkipLayerTest(tf.test.TestCase):
       self.assertAllClose(a, out)
 
 
-class UniformLabelSmootherTest(tf.test.TestCase):
+class UniformLabelSmootherTest(test_utils.TestCase):
 
   def testUniformLabelSmoother(self):
     with self.session(use_gpu=False):
@@ -3123,7 +3398,7 @@ class UniformLabelSmootherTest(tf.test.TestCase):
       self.assertAllClose(np.ones(output_v.shape[:-1]), output_v.sum(-1))
 
 
-class WeightedSumLayerTest(tf.test.TestCase):
+class WeightedSumLayerTest(test_utils.TestCase):
 
   def testWeightedSumLayer(self):
     with self.session(use_gpu=True) as sess:
@@ -3186,7 +3461,7 @@ class WeightedSumLayerTest(tf.test.TestCase):
       self.assertAllClose(expected_ctx, actual_ctx, rtol=1e-05, atol=1e-05)
 
 
-class GatedAverageLayerTest(tf.test.TestCase):
+class GatedAverageLayerTest(test_utils.TestCase):
 
   def testGatedAverageLayer(self):
     with self.session(use_gpu=True) as sess:
@@ -3223,7 +3498,7 @@ class GatedAverageLayerTest(tf.test.TestCase):
       self.assertAllClose(expected_avg, actual_avg, rtol=1e-05, atol=1e-05)
 
 
-class LHUCLayerTest(tf.test.TestCase):
+class LHUCLayerTest(test_utils.TestCase):
 
   def testLHUCLayer(self):
     with self.session(use_gpu=True) as sess:
@@ -3252,7 +3527,7 @@ class LHUCLayerTest(tf.test.TestCase):
       self.assertAllClose(expected_avg, actual_avg, rtol=1e-05, atol=1e-05)
 
 
-class ResidualAdapterLayerTest(tf.test.TestCase):
+class ResidualAdapterLayerTest(test_utils.TestCase):
 
   def testResidualAdapterLayer(self):
     with self.session(use_gpu=True) as sess:
@@ -3282,7 +3557,7 @@ class ResidualAdapterLayerTest(tf.test.TestCase):
       self.assertAllClose(expected_avg, actual_avg, rtol=1e-05, atol=1e-05)
 
 
-class GluLayerTest(tf.test.TestCase):
+class GluLayerTest(test_utils.TestCase):
 
   def testGlu(self):
     with self.session(use_gpu=True) as sess:

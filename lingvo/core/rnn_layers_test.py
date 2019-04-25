@@ -61,7 +61,7 @@ def AddTimestepAccumulator(layer):
   layer.RegisterAccumulator('ts_count', TimestepAccumulator())
 
 
-class LayersTestBase(tf.test.TestCase):
+class LayersTestBase(test_utils.TestCase):
 
   def _testStackedFRNNHelper(self,
                              cls,
@@ -170,7 +170,7 @@ class LayersTestBase(tf.test.TestCase):
         loss = tf.reduce_sum(sfrnn_outputs)
         for fin in sfrnn_final.rnn:
           loss += tf.reduce_sum(fin.m) + tf.reduce_sum(fin.c)
-      xs = sfrnn.theta.Flatten() + [inputs]
+      xs = sfrnn.vars.Flatten() + [inputs]
       dxs = tf.gradients(loss, xs)
 
       # Compares the sym grad against the numeric grads.
@@ -685,7 +685,7 @@ class LayersTest(LayersTestBase):
                             [rnn_params.sequence_length, -1, 1, 1, 1])
       loss = tf.reduce_sum(tf.reduce_sum(
           outputs, axis=0)) + tf.reduce_sum(final.m + final.c)
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       assert len(all_vars) == 2
 
       grads = tf.gradients(loss, all_vars)
@@ -728,7 +728,7 @@ class LayersTest(LayersTestBase):
       outputs, final = frnn.FPropDefaultTheta(inputs_sequence, paddings)
       outputs *= tf.reshape(paddings, [10, 3, 1, 1, 1])
       loss = tf.reduce_sum(outputs) + tf.reduce_sum(final.m + final.c)
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       assert len(all_vars) == 2
 
       grads = tf.gradients(loss, all_vars)

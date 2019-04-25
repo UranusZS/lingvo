@@ -234,7 +234,7 @@ class Accumulator(Base):
   def __init__(self, params):
     super(Accumulator, self).__init__(params)
     p = self.params
-    self._opt = p.optimizer_tpl.cls(p.optimizer_tpl)
+    self.CreateChild('_opt', p.optimizer_tpl)
 
   def Apply(self, lr, var_grad):
     p = self.params
@@ -266,8 +266,8 @@ class Accumulator(Base):
 
     return tf.cond(
         tf.equal(
-            tf.mod(py_utils.GetOrCreateGlobalStep(), p.accum_steps),
-            p.accum_steps - 1), _ApplyAndReset, lambda: tf.group(tf.no_op()))
+            tf.mod(py_utils.GetGlobalStep(), p.accum_steps), p.accum_steps - 1),
+        _ApplyAndReset, lambda: tf.group(tf.no_op()))
 
   def GetOptimizer(self, lr):
     return self._opt.GetOptimizer(lr)

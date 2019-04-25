@@ -19,16 +19,17 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
+from lingvo.core import test_utils
 from lingvo.tasks.asr.tools import simple_wer
 
 
-class SimpleWerTest(tf.test.TestCase):
+class SimpleWerTest(test_utils.TestCase):
 
   def testWerIgnorePunctuation(self):
     hyp = 'hello  world. today is a good day, how are you'
     ref = '(Hello world)!    [Today] is a good day! How are you?'
-    ne, nw = simple_wer.ComputeWER(hyp, ref)
-    self.assertEqual(ne, 0)
+    errs, nw, _ = simple_wer.ComputeWER(hyp, ref)
+    self.assertEqual(sum(errs.values()), 0)
     self.assertEqual(nw, 10)
 
 

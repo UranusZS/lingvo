@@ -32,12 +32,13 @@ from lingvo.core import cluster_factory
 from lingvo.core import py_utils
 from lingvo.core import recurrent
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tasks.image.params import mnist  # pylint: disable=unused-import
 
 FLAGS = tf.flags.FLAGS
 
 
-class PyUtilsTest(tf.test.TestCase):
+class PyUtilsTest(test_utils.TestCase):
 
   def testIsDefaultParamInit(self):
     p = py_utils.DefaultParamInit()
@@ -54,9 +55,11 @@ class PyUtilsTest(tf.test.TestCase):
           py_utils.WeightInit.UniformSqrtDim,
           py_utils.WeightInit.UniformUnitScaling,
           py_utils.WeightInit.TruncatedGaussianSqrtDim,
+          py_utils.WeightInit.TruncatedGaussianSqrtFanIn,
+          py_utils.WeightInit.TruncatedGaussianSqrtFanOut,
       ]
       dtypes = [tf.float32, tf.float64, tf.complex64]
-      shapes = [[], [3], [2, 4]]
+      shapes = [[], [3], [2, 4], [3, 3, 2, 4]]
       collections = ['col1', 'col2']
 
       all_vars = []
@@ -68,7 +71,7 @@ class PyUtilsTest(tf.test.TestCase):
       # To reuse existing variables
       tf.get_variable_scope().reuse_variables()
 
-      self.assertEqual(len(tf.all_variables()), len(all_vars))
+      self.assertEqual(len(tf.trainable_variables()), len(all_vars))
 
       all_vars_copy = []
       for i, (m, dt, sp) in enumerate(
@@ -146,6 +149,43 @@ class PyUtilsTest(tf.test.TestCase):
       self.assertAllClose(v1_v_expted, v1_v.tolist())
       self.assertAllClose(v2_v_expted, v2_v.tolist())
       self.assertAllClose(v3_v_expted, v3_v.tolist())
+
+  def testCreateVariableSqrtFanInOut(self):
+    with self.session() as sess:
+      tf.set_random_seed(832124)
+      methods = [
+          py_utils.WeightInit.GaussianSqrtFanIn,
+          py_utils.WeightInit.TruncatedGaussianSqrtFanIn,
+          py_utils.WeightInit.GaussianSqrtFanOut,
+          py_utils.WeightInit.TruncatedGaussianSqrtFanOut,
+      ]
+      dtypes = [tf.float32]
+      shapes = [[1, 1, 2, 3]]
+      all_vars = []
+      for i, (dt, m,
+              sp) in enumerate(itertools.product(dtypes, methods, shapes)):
+        pc = py_utils.WeightParams(sp, m(scale=2), dt)
+        all_vars.append(py_utils.CreateVariable('var_%d' % i, pc)[0])
+
+      tf.global_variables_initializer().run()
+      var_values = sess.run(all_vars)
+      tf.logging.info('var_values=%s', var_values)
+      self.assertAllClose(
+          [
+              # GaussianSqrtFanIn.
+              [[[[-2.08201575, 1.35793388, -0.27236053],
+                 [-0.65320235, 1.43985856, 0.09011276]]]],
+              # TruncatedGaussianSqrtFanIn.
+              [[[[-1.72450912, -1.37630582, 1.65029943],
+                 [-0.15342039, -0.7636584, -0.97026265]]]],
+              # GaussianSqrtFanOut.
+              [[[[1.16101539, 1.4432559, -0.03035267],
+                 [0.9992612, 1.01232362, 2.30517101]]]],
+              # TruncatedGaussianSqrtFanOut.
+              [[[[-0.049076, -0.25183302, -1.79192507],
+                 [0.93166995, -0.83121753, -1.40264213]]]],
+          ],
+          var_values)
 
   def testCreateVariableException(self):
     with self.session(use_gpu=False, graph=tf.Graph()):
@@ -292,13 +332,10 @@ class PyUtilsTest(tf.test.TestCase):
       self.assertAllEqual(x.eval(), [[1, 2], [3, 4]])
 
   def testSave(self):
-    g = tf.Graph()
-    with g.as_default():
+    with self.session() as sess:
       x = tf.constant([[1, 2], [3, 4]])
       y = tf.constant([10] * 4)
       x = py_utils.Save(x, '%s/test' % self.get_temp_dir(), x=x, y=y)
-
-    with self.session(graph=g) as sess:
       sess.run(tf.global_variables_initializer())
       self.assertAllEqual(sess.run(x), [[1, 2], [3, 4]])
 
@@ -376,14 +413,14 @@ class PyUtilsTest(tf.test.TestCase):
       self.assertTrue(v1 is v)
     self.assertTrue(v1 is not x1)
 
-  def testGetOrCreateGlobalStep(self):
+  def testGetOrCreateGlobalStepVar(self):
     with tf.variable_scope('s1'):
       with tf.name_scope('s2'):
-        gs1 = py_utils.GetOrCreateGlobalStep()
+        gs1 = py_utils.GetOrCreateGlobalStepVar()
         gs2 = tf.train.get_global_step()
-      gs3 = py_utils.GetOrCreateGlobalStep()
+      gs3 = py_utils.GetOrCreateGlobalStepVar()
       gs4 = tf.train.get_global_step()
-    gs5 = py_utils.GetOrCreateGlobalStep()
+    gs5 = py_utils.GetOrCreateGlobalStepVar()
     gs6 = tf.train.get_global_step()
     for gs in [gs2, gs3, gs4, gs5, gs6]:
       self.assertTrue(gs1 is gs)
@@ -431,6 +468,20 @@ class PyUtilsTest(tf.test.TestCase):
       # is None; e is not computed by l and aa is a duplicated.
       self.assertEqual([_[0] for _ in var_grads.FlattenItems()], ['a'])
       self.assertEqual(var_grads.a[0].name, 'a:0')
+
+  def testClipSingleTensorGradients(self):
+
+    a = tf.get_variable('a', [])
+    b = tf.get_variable('b', [])
+    vs_gs = py_utils.NestedMap(
+        a=(a, tf.ones_like(a) * 10.0), b=(b, tf.ones_like(b) * 0.5))
+    clipped = py_utils.ApplyGradNormCliping(vs_gs, norm=1.0)
+    with self.session(use_gpu=False) as sess:
+      tf.global_variables_initializer().run()
+      clipped_np = sess.run(clipped)
+      # Each variable is clipped indipendently to grad scale of 1.
+      self.assertAllClose(clipped_np.a[1], 1.0)
+      self.assertAllClose(clipped_np.b[1], 0.5)
 
   def testMaskGradient(self):
     with self.session(use_gpu=False) as sess:
@@ -754,7 +805,7 @@ class PyUtilsTest(tf.test.TestCase):
       self.assertAllEqual(stacked.z.a, tf.constant([[1, 2], [10, 20]]))
 
 
-class DeterministicDropoutTest(tf.test.TestCase):
+class DeterministicDropoutTest(test_utils.TestCase):
 
   def testDeterministicDropoutTest(self):
     x = tf.ones([4, 6], dtype=tf.float32)
@@ -773,7 +824,7 @@ class DeterministicDropoutTest(tf.test.TestCase):
       self.assertEqual(x_val.dtype, np.float32)
 
 
-class WeightedAvgTest(tf.test.TestCase):
+class WeightedAvgTest(test_utils.TestCase):
 
   def testWeightedAvg(self):
     with self.session(use_gpu=False) as sess:
@@ -851,7 +902,7 @@ class WeightedAvgTest(tf.test.TestCase):
       py_utils.CombineMetrics([(a, 0.7), (b, 0.3), (c, 1.5)])
 
 
-class OverrideVarsFromCheckpointsTest(tf.test.TestCase):
+class OverrideVarsFromCheckpointsTest(test_utils.TestCase):
 
   def _GetLeNetVarsFirstVal(self, sess):
     with tf.variable_scope('lenet5', reuse=True):
@@ -912,7 +963,7 @@ class OverrideVarsFromCheckpointsTest(tf.test.TestCase):
           [0.043092, -0.036722, 0.0])
 
 
-class NestedMapTest(tf.test.TestCase):
+class NestedMapTest(test_utils.TestCase):
 
   def testBasic(self):
     x = py_utils.NestedMap()
@@ -1084,7 +1135,7 @@ class NestedMapTest(tf.test.TestCase):
     self.assertEqual('z', y.c.d)
 
 
-class ReadOnlyAttrDictViewTest(tf.test.TestCase):
+class ReadOnlyAttrDictViewTest(test_utils.TestCase):
 
   def testWrapping(self):
     backing = dict()
@@ -1111,7 +1162,7 @@ class ReadOnlyAttrDictViewTest(tf.test.TestCase):
     self.assertEquals(1, view['test'])
 
 
-class PadSequenceDimensionTest(tf.test.TestCase):
+class PadSequenceDimensionTest(test_utils.TestCase):
 
   def testPadSequenceDimension_2D(self):
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
@@ -1174,7 +1225,7 @@ class PadSequenceDimensionTest(tf.test.TestCase):
                         (32, 3, 4, 5))
 
 
-class PadOrTrimToTest(tf.test.TestCase):
+class PadOrTrimToTest(test_utils.TestCase):
 
   def test2DConstantShape(self):
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
@@ -1235,7 +1286,7 @@ class PadOrTrimToTest(tf.test.TestCase):
       self.assertAllClose(expected_x, real_x)
 
 
-class ApplyPaddingTest(tf.test.TestCase):
+class ApplyPaddingTest(test_utils.TestCase):
 
   def testApplyPaddingToZeroWithBroadcast(self):
     with self.session():
@@ -1276,7 +1327,7 @@ class ApplyPaddingTest(tf.test.TestCase):
       self.assertAllClose(y, [[1.0, 2.0], [0.0, 4.0], [5.0, 0.0]])
 
 
-class TrimTrailingPaddingsTest(tf.test.TestCase):
+class TrimTrailingPaddingsTest(test_utils.TestCase):
 
   def test2D(self):
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
@@ -1365,7 +1416,7 @@ class TrimTrailingPaddingsTest(tf.test.TestCase):
       self.assertAllEqual(padding[:, :1], trimmed_padding)
 
 
-class ReversePaddedSequenceTest(tf.test.TestCase):
+class ReversePaddedSequenceTest(test_utils.TestCase):
 
   def testReversePaddedSequence(self):
     with self.session(use_gpu=False):
@@ -1386,7 +1437,7 @@ class ReversePaddedSequenceTest(tf.test.TestCase):
       self.assertAllClose(expected_output, actual_output)
 
 
-class RetryTest(tf.test.TestCase):
+class RetryTest(test_utils.TestCase):
 
   def testRetry(self):
     max_retries = 5
@@ -1406,7 +1457,7 @@ class RetryTest(tf.test.TestCase):
     self.assertEqual(1 + max_retries, state['count'])
 
 
-class MixByWeightTest(tf.test.TestCase):
+class MixByWeightTest(test_utils.TestCase):
 
   def testMixByWeight(self):
     var_a = tf.get_variable('a', trainable=False, initializer=0)
@@ -1484,58 +1535,70 @@ class MixByWeightTest(tf.test.TestCase):
       self.assertAllClose(np.array([0, 1]), np.squeeze(bprop_v))
 
 
-class SequencesToDebugStrings(tf.test.TestCase):
+class SequencesToDebugStrings(test_utils.TestCase):
 
   def testSequencesToDebugStrings(self):
     with self.session():
-      self.assertAllEqual(['[1 2 3]', '[100 200]'],
+      self.assertAllEqual([b'[1 2 3]', b'[100 200]'],
                           py_utils.SequencesToDebugStrings(
                               tf.constant([[1, 2, 3], [100, 200, 300]],
                                           dtype=tf.int32),
                               tf.constant([3, 2], dtype=tf.int32)).eval())
 
 
-class StepSeedTest(tf.test.TestCase):
+class StepSeedTest(test_utils.TestCase):
+
+  def _testStepSeedHelper(self, sess, step_fn, expected_starting_step_seed):
+    state0 = py_utils.NestedMap(
+        input=tf.constant(0, dtype=tf.int64),
+        seed_pair=tf.zeros(2, dtype=tf.int64))
+    inputs = py_utils.NestedMap(input=tf.range(10, dtype=tf.int64))
+
+    p = base_layer.BaseLayer.Params().Set(name='test')
+    accumulated_states, _ = recurrent.Recurrent(
+        p.cls(p).theta, state0, inputs, step_fn)
+
+    sess.run(tf.global_variables_initializer())
+    accumulated_states = accumulated_states.Pack(
+        sess.run(accumulated_states.Flatten()))
+    self.assertAllEqual(np.arange(10), accumulated_states.input)
+    expected_step_seeds = expected_starting_step_seed + np.arange(10)
+    self.assertAllEqual(
+        np.stack((np.zeros(10), expected_step_seeds), axis=1),
+        accumulated_states.seed_pair)
 
   def testStepSeed(self):
     p = base_layer.BaseLayer.Params()
-    state0 = py_utils.NestedMap(
-        input=tf.constant(0, dtype=tf.int64),
-        seed_pair=tf.zeros(2, dtype=tf.int64),
-        step_seed=py_utils.GetStepSeed(),
-        global_step=py_utils.GetOrCreateGlobalStep())
-    inputs = py_utils.NestedMap(input=tf.range(10, dtype=tf.int64))
 
-    def RecurrentStep(unused_theta, state0, inputs):
-      graph = tf.get_default_graph()
-      if not graph.get_collection(tf.GraphKeys.GLOBAL_STEP):
-        graph.add_to_collection(tf.GraphKeys.GLOBAL_STEP, state0.global_step)
-      py_utils.ResetStepSeed(state0.step_seed)
-
+    def RecurrentStep(theta, unused_state0, inputs):
       state1 = py_utils.NestedMap()
       state1.input = inputs.input
-      state1.seed_pair = py_utils.GenerateStepSeedPair(p)
-      state1.step_seed = py_utils.GetStepSeed()
-      state1.global_step = py_utils.GetOrCreateGlobalStep()
+      state1.seed_pair = py_utils.GenerateStepSeedPair(p, theta.global_step)
       return state1, py_utils.NestedMap()
 
-    accumulated_states, _ = recurrent.Recurrent(py_utils.NestedMap(), state0,
-                                                inputs, RecurrentStep)
+    with self.session(graph=tf.Graph()) as sess:
+      self._testStepSeedHelper(sess, RecurrentStep, 0)
+      # Second recurrent inside the same graph has different step_seeds.
+      self._testStepSeedHelper(sess, RecurrentStep, 641992038)
 
-    with self.session() as sess:
-      sess.run(tf.global_variables_initializer())
-      accumulated_states = accumulated_states.Pack(
-          sess.run(accumulated_states.Flatten()))
-      self.assertAllEqual(np.arange(10), accumulated_states.input)
-      self.assertAllEqual(np.zeros(10), accumulated_states.global_step)
-      # The step seed in the state is actually for the **next** step.
-      self.assertAllEqual(np.arange(1, 11), accumulated_states.step_seed)
-      self.assertAllEqual(
-          np.stack((np.zeros(10), np.arange(10)), axis=1),
-          accumulated_states.seed_pair)
+    # After a reset, the step_seeds are the same even with a slightly
+    # different RecurrentStep function.
+    def RecurrentStep2(theta, state0, inputs):
+      with tf.control_dependencies([tf.no_op()]):
+        return RecurrentStep(theta, state0, inputs)
+
+    with self.session(graph=tf.Graph()) as sess:
+      self._testStepSeedHelper(sess, RecurrentStep2, 0)
+      self._testStepSeedHelper(sess, RecurrentStep2, 641992038)
+
+    with self.session(graph=tf.Graph()) as sess:
+      # But a different name_scope changes it.
+      with tf.name_scope('test'):
+        self._testStepSeedHelper(sess, RecurrentStep2, 0)
+        self._testStepSeedHelper(sess, RecurrentStep2, 1169426261)
 
 
-class WeightInitTest(tf.test.TestCase):
+class WeightInitTest(test_utils.TestCase):
 
   def testUniformPositive(self):
     with self.session(use_gpu=False, graph=tf.Graph()):
@@ -1578,6 +1641,56 @@ class WeightInitTest(tf.test.TestCase):
       bound = np.sqrt(3.) * np.sqrt(2. / 6.) / np.sqrt(20)
       self.assertTrue(np.all(var_v >= -bound))
       self.assertTrue(np.all(var_v <= bound))
+
+
+class RNNCellStateInitTest(test_utils.TestCase):
+
+  def testZeros(self):
+    with self.session(use_gpu=False, graph=tf.Graph()):
+      tf.set_random_seed(12345678)
+      zero_state = py_utils.InitRNNCellState(
+          [2, 3], init=py_utils.RNNCellStateInit.Zeros(), dtype=tf.float32)
+      tf.global_variables_initializer().run()
+      zero_state_v = zero_state.eval()
+      expected_zero_state = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+      self.assertAllClose(zero_state_v, expected_zero_state)
+
+  def testRandomNormal(self):
+    with self.session(use_gpu=False, graph=tf.Graph()):
+      tf.set_random_seed(12345678)
+      zero_state = py_utils.InitRNNCellState(
+          [2, 3],
+          init=py_utils.RNNCellStateInit.RandomNormal(seed=12345),
+          dtype=tf.float32)
+      tf.global_variables_initializer().run()
+      zero_state_v = zero_state.eval()
+      expected_zero_state = [[1.621003, -1.097501, 0.493424],
+                             [-1.048426, 2.73048, 0.091445]]
+      self.assertAllClose(zero_state_v, expected_zero_state)
+
+
+class RematerializeFnTest(tf.test.TestCase):
+
+  def testRandomNormal(self):
+    with self.session(use_gpu=False, graph=tf.Graph()) as sess:
+      tf.set_random_seed(12345678)
+      a = tf.random.normal([2, 3])
+      b = tf.random.normal([3, 4])
+
+      def Fn(a, b):
+        c = tf.matmul(a, b)
+        d = tf.nn.sigmoid(c)
+        e = tf.nn.tanh(c)
+        return d, e
+
+      d1, e1 = Fn(a, b)
+      d2, e2 = py_utils.RematerializeFn(Fn, a, b)
+      da1, db1 = tf.gradients([d1, e1], [a, b])
+      da2, db2 = tf.gradients([d2, e2], [a, b])
+      tf.global_variables_initializer().run()
+      v1, v2, v3, v4 = sess.run([da1, db1, da2, db2])
+      self.assertAllEqual(v1, v3)
+      self.assertAllEqual(v2, v4)
 
 
 if __name__ == '__main__':

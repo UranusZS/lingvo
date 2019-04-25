@@ -8,6 +8,7 @@ py_library(
     name = "frontend",
     srcs = ["frontend.py"],
     deps = [
+        # Implicit tensorflow dependency.
         "//lingvo/core:base_layer",
         "//lingvo/core:py_utils",
     ],
@@ -26,6 +27,7 @@ py_test(
         # Implicit tensorflow dependency.
         "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -51,8 +53,7 @@ py_test(
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
-        "//lingvo/core:py_utils",
-        "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -112,6 +113,7 @@ py_test(
     deps = [
         ":decoder_utils",
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -158,6 +160,7 @@ py_test(
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:cluster_factory",
+        "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
         "//lingvo/core/ops:hyps_py_pb2",

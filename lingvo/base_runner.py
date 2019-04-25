@@ -264,7 +264,7 @@ class BaseRunner(object):
     with tf.container(self._container_id), self._GetSession() as sess:
       if self.initialize_tables is not None:
         sess.run(self.initialize_tables)
-      gsteps = self._model.global_step
+      gsteps = py_utils.GetGlobalStep()
       local_enqueue_steps = 0
 
       # Global enqueue steps measures how many global steps have data enqueued
@@ -275,7 +275,7 @@ class BaseRunner(object):
       tf.logging.info('params.train.max_steps: %d, enqueue_max_steps: %d',
                       self.params.train.max_steps, FLAGS.enqueue_max_steps)
       while True:
-        global_step, = sess.run([gsteps])
+        global_step = sess.run(gsteps)
         if global_enqueue_steps is None:
           global_enqueue_steps = global_step
         if local_enqueue_steps % 1000 == 0:
@@ -346,7 +346,7 @@ class BaseRunner(object):
             job_name, global_step)
         continue
       summary_writer.add_summary(summary, global_step)
-      if summary.value[0].HasField('simple_value'):
+      if summary.value and summary.value[0].HasField('simple_value'):
         value = summary.value[0].simple_value
         tf.logging.info('%s summary on checkpoint@%d %s = %.8g', job_name,
                         global_step, name, value)

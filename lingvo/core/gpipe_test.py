@@ -19,9 +19,9 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
 from lingvo.core import base_layer
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 from lingvo.core.gpipe import FeatureExtractionLayer
 from lingvo.core.gpipe import PipeliningLayer
 from lingvo.core.layers import Conv2DLayerNoPadding
@@ -123,14 +123,13 @@ def _BuildDummyPipelineCnn(num_splits=4, num_micro_batches=8):
   return layer
 
 
-class DummyPipelineCnnTest(tf.test.TestCase):
+class DummyPipelineCnnTest(test_utils.TestCase):
 
   def _verify_timestep_counts(self, num_splits):
     num_micro_batches = 8
     batch_size = 16
-    g = tf.Graph()
-    with g.as_default():
-      py_utils.GetOrCreateGlobalStep()
+    with self.session(graph=tf.Graph()) as sess:
+      py_utils.GetGlobalStep()
       tf.set_random_seed(1245)
       inputs = tf.random_uniform([batch_size, 8, 8, 1])
       net = _BuildDummyPipelineCnn(
@@ -145,7 +144,7 @@ class DummyPipelineCnnTest(tf.test.TestCase):
       grads = tf.gradients(loss, tf.trainable_variables())
       grad_norm = tf.sqrt(py_utils.SumSquared(grads))
       ts = net.GetAccumulatorValues().Flatten()
-    with self.session(graph=g) as sess:
+
       sess.run(tf.global_variables_initializer())
       grad_norm_val, ts_vals = sess.run([grad_norm, ts])
       self.assertNear(grad_norm_val, 0.269997, err=1.0e-6)

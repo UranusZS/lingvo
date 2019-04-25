@@ -19,7 +19,6 @@ from __future__ import print_function
 
 import numpy as np
 import tensorflow as tf
-
 from tensorflow.contrib.cudnn_rnn.python.ops import cudnn_rnn_ops
 from tensorflow.python.ops import gen_cudnn_rnn_ops
 
@@ -27,6 +26,7 @@ from lingvo.core import cudnn_rnn_utils
 from lingvo.core import py_utils
 from lingvo.core import quant_utils
 from lingvo.core import rnn_cell
+from lingvo.core import test_utils
 
 UNI_RNN = cudnn_rnn_ops.CUDNN_RNN_UNIDIRECTION
 BI_RNN = cudnn_rnn_ops.CUDNN_RNN_BIDIRECTION
@@ -36,7 +36,7 @@ _NUMPY_RANDOM_SEED = 12345
 _RANDOM_SEED = 98274
 
 
-class RNNCellTest(tf.test.TestCase):
+class RNNCellTest(test_utils.TestCase):
 
   def testGRUCell(self, inline=False, enable_gru_bias=True):
     with self.session(
@@ -283,14 +283,14 @@ class RNNCellTest(tf.test.TestCase):
           quant_start_step=0,
           start_cap=1.0,
           end_cap=1.0)
-      params.qdomain.default = quant_utils.SymetricScheduledClipQDomain.Params(
+      params.qdomain.default = quant_utils.SymmetricScheduledClipQDomain.Params(
       ).Set(cc_schedule=cc_schedule.Copy())
-      params.qdomain.c_state = quant_utils.SymetricScheduledClipQDomain.Params(
+      params.qdomain.c_state = quant_utils.SymmetricScheduledClipQDomain.Params(
       ).Set(cc_schedule=cc_schedule.Copy())
-      params.qdomain.m_state = quant_utils.SymetricScheduledClipQDomain.Params(
+      params.qdomain.m_state = quant_utils.SymmetricScheduledClipQDomain.Params(
       ).Set(cc_schedule=cc_schedule.Copy())
       params.qdomain.fullyconnected = (
-          quant_utils.SymetricScheduledClipQDomain.Params().Set(
+          quant_utils.SymmetricScheduledClipQDomain.Params().Set(
               cc_schedule=cc_schedule.Copy()))
 
       params.cell_value_cap = None
@@ -328,27 +328,29 @@ class RNNCellTest(tf.test.TestCase):
       wts = tf.get_collection('LSTMCellSimple_vars')
       self.assertEqual(variable_count, len(wts))
 
-      # pyformat: disable
       if enable_lstm_bias:
         m_expected = [
-            [0.039524, 0.477746],
-            [0.006711, 0.447337],
-            [0.013737, 0.550308]]
+            [0.039062, 0.476562],
+            [0.007812, 0.445312],
+            [0.015625, 0.546875],
+        ]
         c_expected = [
-            [0.148034, 0.783791],
-            [0.019434, 0.714024],
-            [0.041597, 0.982957]]
+            [0.148438, 0.78125],
+            [0.023438, 0.710938],
+            [0.039062, 0.984375],
+        ]
       else:
         m_expected = [
-            [0.092073, 0.459963],
-            [0.048523, 0.182147],
-            [0.038683, 0.372883]]
+            [0.09375, 0.460938],
+            [0.046875, 0.179688],
+            [0.039062, 0.375],
+        ]
         c_expected = [
-            [0.232411, 0.792142],
-            [0.090428, 0.354446],
-            [0.074322, 0.660205]]
+            [0.234375, 0.789062],
+            [0.09375, 0.351562],
+            [0.078125, 0.664062],
+        ]
 
-      # pyformat: enable
       self.assertAllClose(m_expected, state1.m.eval())
       self.assertAllClose(c_expected, state1.c.eval())
 
@@ -1338,12 +1340,9 @@ class RNNCellTest(tf.test.TestCase):
       lstm_vars = lstm.vars
       print('lstm vars = ', lstm_vars)
       self.assertTrue('wm' in lstm_vars.wm.name)
-      self.assertTrue('cap' in lstm_vars.cc_schedule.cap.name)
 
       wm = lstm.theta.wm
-      cap = lstm.theta.cc_schedule.cap
       self.assertEqual(wm.get_shape(), tf.TensorShape([4, 8]))
-      self.assertEqual(cap.get_shape(), tf.TensorShape([]))
 
       np.random.seed(_NUMPY_RANDOM_SEED)
       inputs = py_utils.NestedMap(
@@ -1359,8 +1358,7 @@ class RNNCellTest(tf.test.TestCase):
       c_expected = [[0.0, 0.], [0.0, 0.], [0.0, 0.]]
       self.assertAllClose(m_expected, state1.m.eval())
       self.assertAllClose(c_expected, state1.c.eval())
-      update_op = lstm.PostTrainingStepUpdate(1)
-      sess.run(update_op)
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 1))
 
   def testQuantizedLayerNormalizedLSTMCell(self):
     params = rnn_cell.LayerNormalizedLSTMCell.Params()
@@ -1379,12 +1377,9 @@ class RNNCellTest(tf.test.TestCase):
     lstm_vars = lstm.vars
     print('lstm vars = ', lstm_vars)
     self.assertTrue('wm' in lstm_vars.wm.name)
-    self.assertTrue('cap' in lstm_vars.cc_schedule.cap.name)
 
     wm = lstm.theta.wm
-    cap = lstm.theta.cc_schedule.cap
     self.assertEqual(wm.get_shape(), tf.TensorShape([4, 8]))
-    self.assertEqual(cap.get_shape(), tf.TensorShape([]))
 
     np.random.seed(_NUMPY_RANDOM_SEED)
     inputs = py_utils.NestedMap(
@@ -1406,10 +1401,11 @@ class RNNCellTest(tf.test.TestCase):
       self.assertAllClose(m_expected, state1.m.eval())
       self.assertAllClose(c_expected, state1.c.eval())
 
-      self.assertEqual(5.0, cap.eval())
-      update_op = lstm.PostTrainingStepUpdate(1)
-      sess.run(update_op)
-      self.assertEqual(3.0, cap.eval())
+      self.assertEqual(5.0,
+                       lstm.cc_schedule.GetState(lstm.theta.cc_schedule).eval())
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 1))
+      self.assertEqual(3.0,
+                       lstm.cc_schedule.GetState(lstm.theta.cc_schedule).eval())
 
   def testQuantizedLSTMCell(self):
     with self.session(use_gpu=False) as sess:
@@ -1429,12 +1425,9 @@ class RNNCellTest(tf.test.TestCase):
       lstm_vars = lstm.vars
       print('lstm vars = ', lstm_vars)
       self.assertTrue('wm' in lstm_vars.wm.name)
-      self.assertTrue('cap' in lstm_vars.cc_schedule.cap.name)
 
       wm = lstm.theta.wm
-      cap = lstm.theta.cc_schedule.cap
       self.assertEqual(wm.get_shape(), tf.TensorShape([4, 8]))
-      self.assertEqual(cap.get_shape(), tf.TensorShape([]))
 
       np.random.seed(_NUMPY_RANDOM_SEED)
       inputs = py_utils.NestedMap(
@@ -1454,10 +1447,11 @@ class RNNCellTest(tf.test.TestCase):
       self.assertAllClose(m_expected, state1.m.eval())
       self.assertAllClose(c_expected, state1.c.eval())
 
-      self.assertEqual(5.0, cap.eval())
-      update_op = lstm.PostTrainingStepUpdate(1)
-      sess.run(update_op)
-      self.assertEqual(3.0, cap.eval())
+      self.assertEqual(5.0,
+                       lstm.cc_schedule.GetState(lstm.theta.cc_schedule).eval())
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 1))
+      self.assertEqual(3.0,
+                       lstm.cc_schedule.GetState(lstm.theta.cc_schedule).eval())
 
   def testQuantizedLSTMCellSimpleTrainingUnclipped(self):
     m_expected = [[0.097589, 0.579055], [0.046737, 0.187892],
@@ -1534,25 +1528,25 @@ class RNNCellTest(tf.test.TestCase):
           start_cap=5.0,
           end_cap=1.0)
 
-      qdomain = quant_utils.SymetricScheduledClipQDomain.Params().Set(
+      qdomain = quant_utils.SymmetricScheduledClipQDomain.Params().Set(
           cc_schedule=cc_schedule)
       params.qdomain.default = qdomain
 
       # M state uses the default 8-bit quantziation.
       cc_schedule = cc_schedule.Copy()
-      qdomain = quant_utils.SymetricScheduledClipQDomain.Params().Set(
+      qdomain = quant_utils.SymmetricScheduledClipQDomain.Params().Set(
           cc_schedule=cc_schedule)
       params.qdomain.m_state = qdomain
 
       # C state uses 16 bit quantization..
       cc_schedule = cc_schedule.Copy().Set(bits=16)
-      qdomain = quant_utils.SymetricScheduledClipQDomain.Params().Set(
+      qdomain = quant_utils.SymmetricScheduledClipQDomain.Params().Set(
           cc_schedule=cc_schedule)
       params.qdomain.c_state = qdomain
 
       # Fully connected layer clips slightly differently.
       cc_schedule = cc_schedule.Copy().Set(start_cap=64.0, end_cap=8.0)
-      qdomain = quant_utils.SymetricScheduledClipQDomain.Params().Set(
+      qdomain = quant_utils.SymmetricScheduledClipQDomain.Params().Set(
           cc_schedule=cc_schedule)
       params.qdomain.fullyconnected = qdomain
 
@@ -1584,8 +1578,7 @@ class RNNCellTest(tf.test.TestCase):
 
       if set_training_step:
         # Get it into the fully clipped/quantized part of the schedule.
-        update_op = lstm.PostTrainingStepUpdate(5)
-        sess.run(update_op)
+        sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 5))
 
       # Outputs.
       self.assertAllClose(m_expected, state1.m.eval())
@@ -1828,6 +1821,49 @@ class RNNCellTest(tf.test.TestCase):
       print('c_v', np.array_repr(c_v))
       self.assertAllClose(m_expected, m_v)
       self.assertAllClose(c_expected, c_v)
+
+  def _testLSTMZeroStateHelper(self, zero_state_init,
+                               expected_init_states=None):
+    with self.session(use_gpu=False) as sess:
+      params = rnn_cell.LSTMCellSimple.Params()
+      params.name = 'lstm'
+      params.params_init = py_utils.WeightInit.Constant(0.1)
+      params.num_input_nodes = 2
+      params.num_output_nodes = 3
+      params.forget_gate_bias = 2.0
+      params.bias_init = py_utils.WeightInit.Constant(0.1)
+      params.dtype = tf.float64
+      params.zero_state_init_params = zero_state_init
+
+      lstm = rnn_cell.LSTMCellSimple(params)
+
+      np.random.seed(_NUMPY_RANDOM_SEED)
+      # Initialize all the variables, and then inspect.
+      tf.global_variables_initializer().run()
+      init_state_value = sess.run(lstm.zero_state(1))
+      tf.logging.info('testLSTMSimpleWithStateInitializationFn m = %s',
+                      np.array_repr(init_state_value['m']))
+      tf.logging.info('testLSTMSimpleWithStateInitializationFn c = %s',
+                      np.array_repr(init_state_value['c']))
+      self.assertAllClose(init_state_value['m'], expected_init_states['m'])
+      self.assertAllClose(init_state_value['c'], expected_init_states['c'])
+
+  def testLSTMSimpleZeroStateFnZeros(self):
+    m = [[0.0, 0.0, 0.0]]
+    c = [[0.0, 0.0, 0.0]]
+    self._testLSTMZeroStateHelper(py_utils.RNNCellStateInit.Zeros(), {
+        'm': m,
+        'c': c
+    })
+
+  def testLSTMSimpleZeroStateFnRandomNormal(self):
+    m = [[-0.630551, -1.208959, -0.348799]]
+    c = [[-0.630551, -1.208959, -0.348799]]
+    self._testLSTMZeroStateHelper(
+        py_utils.RNNCellStateInit.RandomNormal(seed=12345), {
+            'm': m,
+            'c': c
+        })
 
 
 if __name__ == '__main__':

@@ -23,12 +23,12 @@ from __future__ import print_function
 
 import numpy as np
 import tensorflow as tf
-
 from tensorflow.python.framework import function
 
 from lingvo.core import base_layer
 from lingvo.core import py_utils
 from lingvo.core import quant_utils
+from lingvo.core import test_utils
 
 
 class SampleQuantizedProjectionLayer(quant_utils.QuantizableLayer):
@@ -97,7 +97,7 @@ class SampleQuantizedProjectionLayer(quant_utils.QuantizableLayer):
     return out
 
 
-class QuantizableLayerTest(tf.test.TestCase):
+class QuantizableLayerTest(test_utils.TestCase):
   # pyformat: disable
   NO_QDOMAIN_EXPECTED = [
    [[ 0.00071405, -0.03868543, -0.01999986, -0.00994987],
@@ -253,7 +253,7 @@ class QuantizableLayerTest(tf.test.TestCase):
           not_expected=self.NO_QDOMAIN_EXPECTED,
           global_step=9)
 
-  def testLayerWithSymetricScheduledClipQDomain(self):
+  def testLayerWithSymmetricScheduledClipQDomain(self):
     # pyformat: disable
     expected = [
        [[ 0.       , -0.0390625, -0.015625 , -0.0078125],
@@ -268,14 +268,14 @@ class QuantizableLayerTest(tf.test.TestCase):
 
     with self.session() as sess:
       p = SampleQuantizedProjectionLayer.Params()
-      p.qdomain.default = quant_utils.SymetricScheduledClipQDomain.Params()
+      p.qdomain.default = quant_utils.SymmetricScheduledClipQDomain.Params()
       p.qdomain.default.cc_schedule.Set(
           clip_start_step=0,
           clip_end_step=5,
           quant_start_step=10,
       )
       self._testLayerHelper(
-          'testLayerWithSymetricScheduledClipQDomain',
+          'testLayerWithSymmetricScheduledClipQDomain',
           sess,
           p,
           expected=expected,
@@ -304,7 +304,7 @@ class QuantizableLayerTest(tf.test.TestCase):
     tf.global_variables_initializer().run()
 
     if global_step >= 0:
-      sess.run([l.PostTrainingStepUpdate(global_step)])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), global_step))
 
     output = output.eval()
     print('QuantizableLayerTest output', test_case, ':\n',
@@ -364,7 +364,7 @@ class ClippingCapScheduleTest(object):
       cc_schedule = p.cls(p)
       tf.global_variables_initializer().run()
       # Move to fully quantized part of schedule
-      sess.run([cc_schedule.PostTrainingStepUpdate(16)])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 16))
 
       @function.Defun(tf.float32, tf.float32)
       def ExampleFunction8(x, cc_state):
@@ -421,7 +421,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 5: Clipping active but not yet quantizing.
-      sess.run([cc_schedule.PostTrainingStepUpdate(5)])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 5))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0),
           (-6.0, 5.953125))  # 6 * 127/128
@@ -430,7 +430,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 7: Middle of clipping range.
-      sess.run([cc_schedule.PostTrainingStepUpdate(7)])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 7))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0), (-4.0, 3.96875))  # 4 * 127/128
       self.assertAllClose(
@@ -438,7 +438,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 10: End of clipping range.
-      sess.run([cc_schedule.PostTrainingStepUpdate(10)])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 10))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0),
           (-1.0, 0.9921875))  # 1 * 127/128
@@ -447,7 +447,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 11: No more clipping but not yet quantizing.
-      sess.run([cc_schedule.PostTrainingStepUpdate(11)])
+      sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 11))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0),
           (-1.0, 0.9921875))  # 1 * 127/128
@@ -457,7 +457,7 @@ class ClippingCapScheduleTest(object):
 
       # Step 15-16: Quantizing at full clip.
       for step in (15, 16):
-        sess.run([cc_schedule.PostTrainingStepUpdate(step)])
+        sess.run(tf.assign(py_utils.GetOrCreateGlobalStepVar(), step))
         self.assertAllClose(
             self._ClipExample(cc_schedule, 100.0),
             (-1.0, 0.9921875))  # 1 * 127/128

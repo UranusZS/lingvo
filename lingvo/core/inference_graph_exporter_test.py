@@ -19,7 +19,6 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
 from lingvo import model_registry
 from lingvo.core import base_input_generator
 from lingvo.core import base_model
@@ -28,6 +27,7 @@ from lingvo.core import inference_graph_exporter
 from lingvo.core import inference_graph_pb2
 from lingvo.core import predictor
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 
 
 class DummyLegacyModel(base_model.BaseTask):
@@ -38,6 +38,8 @@ class DummyLegacyModel(base_model.BaseTask):
     return p
 
   def Inference(self):
+    if py_utils.use_tpu():
+      raise NotImplementedError('TPU is not supported.')
     with tf.name_scope('inference'):
       feed1 = tf.placeholder(name='feed1_node', dtype=tf.float32, shape=[1])
       fetch1 = tf.identity(feed1, name='fetch1_node')
@@ -106,7 +108,7 @@ class DummyModelParams(base_model_params.SingleTaskModelParams):
     return p
 
 
-class InferenceGraphExporterTest(tf.test.TestCase):
+class InferenceGraphExporterTest(test_utils.TestCase):
 
   def testExportModelParamsWithSubgraphDict(self):
     params = model_registry.GetParams('test.DummyLegacyModelParams', 'Test')
@@ -139,8 +141,23 @@ class InferenceGraphExporterTest(tf.test.TestCase):
     self.assertEqual(subgraph.fetches['fetch1'], 'inference/fetch1_node:0')
     self.assertEqual(subgraph.fetches['fetch_op'], 'inference/fetch1_node')
 
+  def testExportModelDoesNotAffectFlagsOnException(self):
+    initial_flags = {k: tf.flags.FLAGS[k].value for k in tf.flags.FLAGS}
+    params = model_registry.GetParams('test.DummyLegacyModelParams', 'Test')
+    with self.assertRaises(NotImplementedError):
+      inference_graph_exporter.InferenceGraphExporter.Export(
+          params,
+          device_options=inference_graph_exporter.InferenceDeviceOptions(
+              device='tpu',
+              retain_device_placement=False,
+              var_options=None,
+              gen_init_op=True,
+              dtype_override=None))
+    self.assertDictEqual(initial_flags,
+                         {k: tf.flags.FLAGS[k].value for k in tf.flags.FLAGS})
 
-class NoConstGuaranteeScopeTest(tf.test.TestCase):
+
+class NoConstGuaranteeScopeTest(test_utils.TestCase):
 
   def testNoConsting(self):
     with inference_graph_exporter.ConstGuaranteeScope():
@@ -186,7 +203,7 @@ class LinearModel(base_model.BaseTask):
       x = tf.placeholder(dtype=tf.float32, name='input')
       r = tf.random.stateless_uniform([3],
                                       seed=py_utils.GenerateStepSeedPair(
-                                          self.params))
+                                          self.params, self.theta.global_step))
       y = tf.reduce_sum((self._w + r) * x) + self._b
       return {'default': ({'output': y}, {'input': x})}
 
@@ -255,7 +272,7 @@ class LinearModelTpuParamsWithEma(base_model_params.SingleTaskModelParams):
     return p
 
 
-class InferenceGraphExporterLinearModelTest(tf.test.TestCase):
+class InferenceGraphExporterLinearModelTest(test_utils.TestCase):
 
   def testExport(self):
     """Test basic export."""

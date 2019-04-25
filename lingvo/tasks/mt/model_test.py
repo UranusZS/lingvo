@@ -31,6 +31,7 @@ from lingvo.core import lr_schedule
 from lingvo.core import optimizer
 from lingvo.core import py_utils
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tasks.mt import decoder
 from lingvo.tasks.mt import encoder
 from lingvo.tasks.mt import input_generator
@@ -53,7 +54,7 @@ class TestInputGenerator(base_input_generator.BaseSequenceInputGenerator):
     super(TestInputGenerator, self).__init__(params)
     self._step = 0
 
-  def InputBatchSize(self):
+  def GlobalBatchSize(self):
     if self.params.split:
       return 10 / 2
 
@@ -86,23 +87,23 @@ class TestInputGenerator(base_input_generator.BaseSequenceInputGenerator):
       tgt_weights = tf.split(tgt_weights, 2, 0)
 
       ret.src.ids = tf.cond(
-          tf.equal(tf.mod(py_utils.GetOrCreateGlobalStep(), 2), 0),
-          lambda: src_ids[0], lambda: src_ids[1])
+          tf.equal(tf.mod(py_utils.GetGlobalStep(), 2),
+                   0), lambda: src_ids[0], lambda: src_ids[1])
       ret.src.paddings = tf.cond(
-          tf.equal(tf.mod(py_utils.GetOrCreateGlobalStep(), 2), 0),
-          lambda: src_paddings[0], lambda: src_paddings[1])
+          tf.equal(tf.mod(py_utils.GetGlobalStep(), 2),
+                   0), lambda: src_paddings[0], lambda: src_paddings[1])
       ret.tgt.ids = tf.cond(
-          tf.equal(tf.mod(py_utils.GetOrCreateGlobalStep(), 2), 0),
-          lambda: tgt_ids[0], lambda: tgt_ids[1])
+          tf.equal(tf.mod(py_utils.GetGlobalStep(), 2),
+                   0), lambda: tgt_ids[0], lambda: tgt_ids[1])
       ret.tgt.labels = tf.cond(
-          tf.equal(tf.mod(py_utils.GetOrCreateGlobalStep(), 2), 0),
-          lambda: tgt_labels[0], lambda: tgt_labels[1])
+          tf.equal(tf.mod(py_utils.GetGlobalStep(), 2),
+                   0), lambda: tgt_labels[0], lambda: tgt_labels[1])
       ret.tgt.paddings = tf.cond(
-          tf.equal(tf.mod(py_utils.GetOrCreateGlobalStep(), 2), 0),
-          lambda: tgt_paddings[0], lambda: tgt_paddings[1])
+          tf.equal(tf.mod(py_utils.GetGlobalStep(), 2),
+                   0), lambda: tgt_paddings[0], lambda: tgt_paddings[1])
       ret.tgt.weights = tf.cond(
-          tf.equal(tf.mod(py_utils.GetOrCreateGlobalStep(), 2), 0),
-          lambda: tgt_weights[0], lambda: tgt_weights[1])
+          tf.equal(tf.mod(py_utils.GetGlobalStep(), 2),
+                   0), lambda: tgt_weights[0], lambda: tgt_weights[1])
     else:
       ret.src.ids = src_ids
       ret.src.paddings = src_paddings
@@ -114,7 +115,7 @@ class TestInputGenerator(base_input_generator.BaseSequenceInputGenerator):
     return ret
 
 
-class TransformerModelTest(tf.test.TestCase):
+class TransformerModelTest(test_utils.TestCase):
 
   def _InputParams(self):
     p = input_generator.NmtInput.Params()
@@ -125,8 +126,8 @@ class TransformerModelTest(tf.test.TestCase):
     p.file_pattern = 'tfrecord:' + input_file
     p.file_random_seed = 31415
     p.file_parallelism = 1
-    p.bucket_upper_bound = [20, 40]
-    p.bucket_batch_limit = [4, 8]
+    p.bucket_upper_bound = [40]
+    p.bucket_batch_limit = [8]
     p.source_max_length = 200
     p.target_max_length = 200
 
@@ -208,11 +209,13 @@ class TransformerModelTest(tf.test.TestCase):
         vals += [sess.run((loss, logp))]
 
       print('actual vals = %s' % np.array_repr(np.array(vals)))
-      self.assertAllClose(
-          vals, [(189.22296, 10.368382), (282.57202, 10.369616),
-                 (142.55638, 10.367737), (139.9939, 10.369918),
-                 (293.08011, 10.374517)],
-          atol=1e-6, rtol=1e-6)
+      self.assertAllClose(vals, [
+          [233.337143, 10.370541],
+          [235.853119, 10.367168],
+          [217.87796, 10.375141],
+          [217.822205, 10.372487],
+          [159.483185, 10.37289],
+      ])
 
   def testFPropEvalMode(self):
     with self.session() as sess:
@@ -228,10 +231,13 @@ class TransformerModelTest(tf.test.TestCase):
       for _ in range(5):
         vals += [sess.run((loss, logp))]
       print('actual vals = ', vals)
-      self.assertAllClose(
-          vals, [(189.22296, 10.368382), (282.57202, 10.369616),
-                 (142.55638, 10.367737), (139.9939, 10.369918),
-                 (293.08011, 10.374517)])
+      self.assertAllClose(vals, [
+          [233.337143, 10.370541],
+          [235.853119, 10.367168],
+          [217.87796, 10.375141],
+          [217.822205, 10.372487],
+          [159.483185, 10.37289],
+      ])
 
   def testBProp(self):
     with self.session() as sess:
@@ -248,9 +254,13 @@ class TransformerModelTest(tf.test.TestCase):
       for _ in range(5):
         vals += [sess.run((loss, logp, mdl.train_op))[:2]]
       print('BProp actual vals = ', vals)
-      expected_vals = [(189.22296, 10.368382), (282.54092, 10.368474),
-                       (142.48544, 10.362577), (139.91856, 10.364338),
-                       (292.86707, 10.366976)]
+      expected_vals = [
+          [233.337143, 10.370541],
+          [235.809311, 10.365245],
+          [217.793747, 10.371132],
+          [217.679932, 10.365711],
+          [159.340271, 10.363596],
+      ]
       self.assertAllClose(vals, expected_vals)
 
   def testBPropWithAccumComparison(self):
@@ -294,7 +304,7 @@ class TransformerModelTest(tf.test.TestCase):
       tf.global_variables_initializer().run()
 
       for _ in range(2):
-        sess.run((py_utils.GetOrCreateGlobalStep(), loss, logp, mdl.train_op))
+        sess.run((py_utils.GetGlobalStep(), loss, logp, mdl.train_op))
 
       expected = sess.run(mdl.dec.softmax.vars['weight_0'])
 
@@ -312,7 +322,7 @@ class TransformerModelTest(tf.test.TestCase):
 
       tf.global_variables_initializer().run()
 
-      sess.run((py_utils.GetOrCreateGlobalStep(), loss, logp, mdl.train_op))
+      sess.run((py_utils.GetGlobalStep(), loss, logp, mdl.train_op))
 
       actual = sess.run(mdl.dec.softmax.vars['weight_0'])
 
@@ -348,7 +358,7 @@ class TransformerModelTest(tf.test.TestCase):
       loss = mdl.loss
       tf.global_variables_initializer().run()
       _ = sess.run(loss)
-      self.assertEqual(mdl.input_generator.scaled_bucket_batch_limit, [20, 40])
+      self.assertEqual(mdl.input_generator.scaled_bucket_batch_limit, [40])
 
   def testDecode(self):
     with self.session(use_gpu=False) as sess:
@@ -362,12 +372,12 @@ class TransformerModelTest(tf.test.TestCase):
       metrics_dict = mdl.CreateDecoderMetrics()
       key_value_pairs = mdl.PostProcessDecodeOut(dec_out, metrics_dict)
       self.assertNear(0.0, metrics_dict['corpus_bleu'].value, 1.0e-5)
-      self.assertEqual(4, len(key_value_pairs))
+      self.assertLen(key_value_pairs, 8)
       for k, v in key_value_pairs:
         self.assertIn(k, v)
 
 
-class RNMTModelTest(tf.test.TestCase):
+class RNMTModelTest(test_utils.TestCase):
 
   def _InputParams(self):
     p = input_generator.NmtInput.Params()
@@ -378,8 +388,8 @@ class RNMTModelTest(tf.test.TestCase):
     p.file_pattern = 'tfrecord:' + input_file
     p.file_random_seed = 31415
     p.file_parallelism = 1
-    p.bucket_upper_bound = [20, 40]
-    p.bucket_batch_limit = [4, 8]
+    p.bucket_upper_bound = [40]
+    p.bucket_batch_limit = [8]
     p.source_max_length = 200
     p.target_max_length = 200
 
@@ -450,9 +460,13 @@ class RNMTModelTest(tf.test.TestCase):
       vals = []
       for _ in range(5):
         vals += [sess.run((loss, logp))]
-      self.assertAllClose(vals, [(189.31619, 10.37349), (282.67767, 10.373495),
-                                 (142.6355, 10.37349), (140.04213, 10.373491),
-                                 (293.05115, 10.373494)])
+      self.assertAllClose(vals, [
+          [233.403564, 10.373495],
+          [235.996948, 10.373494],
+          [217.843338, 10.373493],
+          [217.843338, 10.373491],
+          [159.492432, 10.373494],
+      ])
 
   def testFPropEvalMode(self):
     with self.session() as sess:
@@ -467,9 +481,13 @@ class RNMTModelTest(tf.test.TestCase):
       vals = []
       for _ in range(5):
         vals += [sess.run((loss, logp))]
-      self.assertAllClose(vals, [(189.31619, 10.37349), (282.67767, 10.373495),
-                                 (142.6355, 10.37349), (140.04213, 10.373491),
-                                 (293.05115, 10.373494)])
+      self.assertAllClose(vals, [
+          [233.403564, 10.373495],
+          [235.996948, 10.373494],
+          [217.843338, 10.373493],
+          [217.843338, 10.373491],
+          [159.492432, 10.373494],
+      ])
 
   def testBProp(self):
     with self.session() as sess:
@@ -485,9 +503,13 @@ class RNMTModelTest(tf.test.TestCase):
       vals = []
       for _ in range(5):
         vals += [sess.run((loss, logp, mdl.train_op))[:2]]
-      expected_vals = [(189.31619, 10.37349), (269.60449, 9.8937426),
-                       (119.08695, 8.6608696), (163.95612, 12.144897),
-                       (402.47745, 14.246991)]
+      expected_vals = [
+          [233.403564, 10.373495],
+          [219.442184, 9.645809],
+          [181.665314, 8.650729],
+          [185.266647, 8.822222],
+          [157.343857, 10.233747],
+      ]
       self.assertAllClose(vals, expected_vals, atol=1e-3)
 
   def testDecode(self):
@@ -503,7 +525,7 @@ class RNMTModelTest(tf.test.TestCase):
       metrics_dict = mdl.CreateDecoderMetrics()
       key_value_pairs = mdl.PostProcessDecodeOut(dec_out, metrics_dict)
       self.assertNear(0.0, metrics_dict['corpus_bleu'].value, 1.0e-5)
-      self.assertEqual(4, len(key_value_pairs))
+      self.assertLen(key_value_pairs, 8)
       for k, v in key_value_pairs:
         self.assertIn(k, v)
 
@@ -544,7 +566,7 @@ class RNMTModelTest(tf.test.TestCase):
       loss = mdl.loss
       tf.global_variables_initializer().run()
       _ = sess.run(loss)
-      self.assertEqual(mdl.input_generator.scaled_bucket_batch_limit, [20, 40])
+      self.assertEqual(mdl.input_generator.scaled_bucket_batch_limit, [40])
 
 
 if __name__ == '__main__':

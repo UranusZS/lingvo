@@ -34,6 +34,7 @@ py_library(
         # Implicit tensorflow dependency.
         "//lingvo/core:layers_with_attention",
         "//lingvo/core:py_utils",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -63,6 +64,7 @@ py_test(
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:py_utils",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -109,6 +111,7 @@ py_library(
         "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
+        "//lingvo/core/ops:hyps_py_pb2",
     ],
 )
 
@@ -139,6 +142,7 @@ py_test(
         # Implicit tensorflow dependency.
         "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -160,6 +164,7 @@ py_library(
 
 py_test(
     name = "model_test",
+    size = "large",
     srcs = ["model_test.py"],
     shard_count = 20,
     deps = [":model_test_lib"],
@@ -177,6 +182,7 @@ py_library(
         ":encoder",
         ":input_generator",
         ":model",
+        # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:base_input_generator",
@@ -186,6 +192,7 @@ py_library(
         "//lingvo/core:optimizer",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 

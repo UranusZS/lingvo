@@ -32,6 +32,7 @@ lingvo_cuda_py_test(
     deps = [
         ":attention",
         ":py_utils",
+        ":quant_utils",
         ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
@@ -74,6 +75,7 @@ py_test(
     deps = [
         ":beam_search_helper",
         ":py_utils",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
@@ -92,6 +94,7 @@ py_test(
     srcs = ["bfloat16_variables_test.py"],
     deps = [
         ":bfloat16_variables",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )
@@ -115,6 +118,7 @@ py_test(
     deps = [
         ":py_utils",
         ":target_sequence_sampler",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
@@ -139,8 +143,8 @@ py_test(
     srcs = ["base_input_generator_test.py"],
     deps = [
         ":base_input_generator",
+        ":test_utils",
         # Implicit numpy dependency.
-        # Implicit six dependency.
         # Implicit tensorflow dependency.
     ],
 )
@@ -157,12 +161,27 @@ py_library(
     ],
 )
 
+py_library(
+    name = "bn_layers",
+    srcs = ["bn_layers.py"],
+    deps = [
+        ":base_layer",
+        ":cluster_factory",
+        ":hyperparams",
+        ":py_utils",
+        # Implicit six dependency.
+        # Implicit tensorflow dependency.
+    ],
+)
+
 py_test(
     name = "base_layer_test",
     size = "small",
     srcs = ["base_layer_test.py"],
     deps = [
         ":base_layer",
+        ":py_utils",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )
@@ -201,6 +220,7 @@ py_test(
         ":layers",
         ":py_utils",
         ":task_scheduler",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
@@ -222,6 +242,7 @@ py_test(
     srcs = ["base_model_params_test.py"],
     deps = [
         ":base_model_params",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )
@@ -262,6 +283,7 @@ py_test(
     deps = [
         ":cluster_factory",
         ":py_utils",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
@@ -283,6 +305,7 @@ lingvo_cuda_py_test(
     srcs = ["cudnn_rnn_utils_test.py"],
     deps = [
         ":cudnn_rnn_utils",
+        ":test_utils",
         # Implicit six dependency.
         # Implicit tensorflow dependency.
     ],
@@ -308,8 +331,9 @@ py_test(
     deps = [
         ":early_stop",
         ":hyperparams",
+        ":test_helper",
+        ":test_utils",
         # Implicit tensorflow dependency.
-        "//lingvo/core:test_helper",
     ],
 )
 
@@ -327,6 +351,7 @@ py_test(
     srcs = ["hyperparams_test.py"],
     deps = [
         ":hyperparams",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )
@@ -367,6 +392,7 @@ py_test(
         ":inference_graph_py_pb2",
         ":predictor_lib",
         ":py_utils",
+        ":test_utils",
         # Implicit tensorflow dependency.
         "//lingvo:model_registry",
     ],
@@ -387,6 +413,7 @@ py_test(
     srcs = ["input_generator_helper_test.py"],
     deps = [
         ":input_generator_helper",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
@@ -398,6 +425,24 @@ py_library(
     srcs = ["layers.py"],
     deps = [
         ":base_layer",
+        ":bn_layers",
+        ":conv_layers_with_time_padding",
+        ":py_utils",
+        ":quant_utils",
+        ":recurrent",
+        ":summary_utils",
+        # Implicit numpy dependency.
+        # Implicit six dependency.
+        # Implicit tensorflow dependency.
+    ],
+)
+
+py_library(
+    name = "conv_layers_with_time_padding",
+    srcs = ["conv_layers_with_time_padding.py"],
+    deps = [
+        ":base_layer",
+        ":bn_layers",
         ":py_utils",
         ":quant_utils",
         ":recurrent",
@@ -412,7 +457,22 @@ lingvo_cuda_py_test(
     name = "layers_test",
     srcs = ["layers_test.py"],
     shard_count = 20,
+    deps = [":layers_test_main_lib"],
+)
+
+lingvo_cuda_py_test(
+    name = "conv_layers_with_time_padding_test",
+    srcs = ["conv_layers_with_time_padding_test.py"],
+    deps = [":layers_test_main_lib"],
+)
+
+py_library(
+    name = "layers_test_main_lib",
+    testonly = True,
+    srcs = ["layers_test.py"],
     deps = [
+        ":conv_layers_with_time_padding",
+        ":gpipe",
         ":layers",
         ":py_utils",
         ":quant_utils",
@@ -438,11 +498,13 @@ py_library(
 py_test(
     name = "lr_schedule_test",
     size = "small",
+    timeout = "moderate",
     srcs = ["lr_schedule_test.py"],
     deps = [
         ":cluster_factory",
         ":early_stop",
         ":lr_schedule",
+        ":test_utils",
         # Implicit six dependency.
         # Implicit tensorflow dependency.
     ],
@@ -452,8 +514,10 @@ py_library(
     name = "metrics",
     srcs = ["metrics.py"],
     deps = [
+        ":plot",
         ":py_utils",
         ":scorers",
+        # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit sklearn dependency.
         # Implicit tensorflow dependency.
@@ -465,6 +529,7 @@ py_test(
     srcs = ["metrics_test.py"],
     deps = [
         ":metrics",
+        ":test_utils",
         # Implicit six dependency.
         # Implicit tensorflow dependency.
     ],
@@ -491,6 +556,7 @@ py_test(
         ":hyperparams",
         ":multitask_model",
         ":py_utils",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )
@@ -499,6 +565,7 @@ py_library(
     name = "optimizer",
     srcs = ["optimizer.py"],
     deps = [
+        ":base_layer",
         ":hyperparams",
         ":py_utils",
         ":summary_utils",
@@ -514,6 +581,7 @@ py_test(
         ":layers",
         ":optimizer",
         ":py_utils",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
@@ -536,6 +604,7 @@ py_test(
     srcs = ["plot_test.py"],
     deps = [
         ":plot",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
@@ -558,6 +627,12 @@ py_library(
 
 lingvo_py_binary(
     name = "predictor",
+    srcs = ["predictor.py"],
+    deps = [":predictor_main_lib"],
+)
+
+py_library(
+    name = "predictor_main_lib",
     srcs = ["predictor.py"],
     deps = [
         ":inference_graph_py_pb2",
@@ -598,10 +673,10 @@ py_test(
         ":py_utils",
         ":recurrent",
         ":test_helper",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
-        # Implicit tensorflow python framework_for_generated_wrappers dependency.
         "//lingvo:model_registry",
         "//lingvo/tasks/image/params:mnist",
     ],
@@ -628,6 +703,7 @@ py_test(
         ":base_layer",
         ":py_utils",
         ":quant_utils",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
@@ -639,18 +715,23 @@ py_library(
     deps = [
         ":base_layer",
         ":gpipe",
+        ":layers",
         ":layers_with_attention",
         ":py_utils",
+        # Implicit six dependency.
         # Implicit tensorflow dependency.
     ],
 )
 
 py_test(
     name = "layers_with_gpipe_test",
+    size = "large",
     srcs = ["layers_with_gpipe_test.py"],
     shard_count = 8,
     deps = [
         ":layers_with_gpipe",
+        ":py_utils",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
@@ -672,11 +753,12 @@ py_test(
     name = "gpipe_test",
     srcs = ["gpipe_test.py"],
     deps = [
+        ":base_layer",
         ":gpipe",
         ":layers",
+        ":py_utils",
+        ":test_utils",
         # Implicit tensorflow dependency.
-        "//lingvo/core:base_layer",
-        "//lingvo/core:py_utils",
     ],
 )
 
@@ -694,6 +776,7 @@ py_library(
 py_test(
     name = "recurrent_test",
     srcs = ["recurrent_test.py"],
+    shard_count = 6,
     deps = [":recurrent_test_lib"],
 )
 
@@ -702,12 +785,14 @@ py_library(
     testonly = True,
     srcs = ["recurrent_test.py"],
     deps = [
+        ":base_layer",
         ":py_utils",
         ":recurrent",
         ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        # Implicit tensorflow python framework_for_generated_wrappers dependency.
     ],
 )
 
@@ -719,7 +804,6 @@ lingvo_cuda_py_test(
         ":py_utils",
         ":recurrent",
         ":test_utils",
-        # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
 )
@@ -737,6 +821,7 @@ py_test(
     srcs = ["retry_test.py"],
     deps = [
         ":retry",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )
@@ -755,6 +840,8 @@ py_test(
     srcs = ["sendrecv_test.py"],
     deps = [
         ":sendrecv",
+        ":test_utils",
+        # Implicit numpy dependency.
         # Implicit tensorflow dependency.
     ],
 )
@@ -788,6 +875,7 @@ py_test(
     deps = [
         ":early_stop",
         ":task_scheduler",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
@@ -806,6 +894,7 @@ py_library(
     name = "test_utils",
     srcs = ["test_utils.py"],
     deps = [
+        ":py_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
@@ -828,9 +917,9 @@ py_library(
         ":base_input_generator",
         ":base_layer",
         ":base_model",
+        ":optimizer",
         ":py_utils",
         # Implicit tensorflow dependency.
-        "//lingvo/core:optimizer",
     ],
 )
 
@@ -847,6 +936,7 @@ py_test(
     name = "wpm_encoder_test",
     srcs = ["wpm_encoder_test.py"],
     deps = [
+        ":test_utils",
         ":wpm_encoder",
         # Implicit tensorflow dependency.
     ],
@@ -873,6 +963,7 @@ py_test(
     ],
     deps = [
         ":test_helper",
+        ":test_utils",
         ":tokenizers",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
@@ -903,8 +994,10 @@ lingvo_cuda_py_test(
         ":py_utils",
         ":quant_utils",
         ":rnn_cell",
+        ":test_utils",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
+        # Implicit tensorflow contrib cudnn_rnn_py dependency.
     ],
 )
 
@@ -960,6 +1053,13 @@ lingvo_cuda_py_test(
     size = "large",
     srcs = ["rnn_layers_test.py"],
     shard_count = 15,
+    deps = [":rnn_layers_test_main_lib"],
+)
+
+py_library(
+    name = "rnn_layers_test_main_lib",
+    testonly = True,
+    srcs = ["rnn_layers_test.py"],
     deps = [
         ":attention",
         ":base_layer",
@@ -990,6 +1090,7 @@ py_test(
     deps = [
         ":scorers",
         ":test_helper",
+        ":test_utils",
         # Implicit tensorflow dependency.
     ],
 )

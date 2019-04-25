@@ -7,14 +7,27 @@
 <!-- This document was automatically generated with bibtex2html 1.98
      (see http://www.lri.fr/~filliatr/bibtex2html/),
      with the following command:
-     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf  -->
+     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf -nf data data -nf sound_examples "sound examples"  -->
 
 
 <table>
 
 <tr valign="top">
 <td align="right" class="bibtexnumber">
-[<a name="chen2018best">1</a>]
+[<a name="freitag2019text">1</a>]
+</td>
+<td class="bibtexitem">
+M.&nbsp;Freitag, I.&nbsp;Caswell, and S.&nbsp;Roy, &ldquo;Text Repair Model for Neural
+  Machine Translation,&rdquo; <em>arXiv e-prints</em>, 2019.
+[&nbsp;<a href="https://arxiv.org/abs/1904.04790">pdf</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="chen2018best">2</a>]
 </td>
 <td class="bibtexitem">
 M.&nbsp;X. Chen, O.&nbsp;Firat, A.&nbsp;Bapna, M.&nbsp;Johnson, W.&nbsp;Macherey, G.&nbsp;Foster, L.&nbsp;Jones,
@@ -30,7 +43,7 @@ M.&nbsp;X. Chen, O.&nbsp;Firat, A.&nbsp;Bapna, M.&nbsp;Johnson, W.&nbsp;Macherey
 
 <tr valign="top">
 <td align="right" class="bibtexnumber">
-[<a name="cherry2018revisiting">2</a>]
+[<a name="cherry2018revisiting">3</a>]
 </td>
 <td class="bibtexitem">
 C.&nbsp;Cherry, G.&nbsp;Foster, A.&nbsp;Bapna, O.&nbsp;Firat, and W.&nbsp;Macherey, &ldquo;Revisiting
@@ -45,7 +58,7 @@ C.&nbsp;Cherry, G.&nbsp;Foster, A.&nbsp;Bapna, O.&nbsp;Firat, and W.&nbsp;Macher
 
 <tr valign="top">
 <td align="right" class="bibtexnumber">
-[<a name="bapna2018training">3</a>]
+[<a name="bapna2018training">4</a>]
 </td>
 <td class="bibtexitem">
 A.&nbsp;Bapna, M.&nbsp;X. Chen, O.&nbsp;Firat, Y.&nbsp;Cao, and Y.&nbsp;Wu, &ldquo;Training deeper neural
@@ -60,7 +73,7 @@ A.&nbsp;Bapna, M.&nbsp;X. Chen, O.&nbsp;Firat, Y.&nbsp;Cao, and Y.&nbsp;Wu, &ldq
 
 <tr valign="top">
 <td align="right" class="bibtexnumber">
-[<a name="wu2016google">4</a>]
+[<a name="wu2016google">5</a>]
 </td>
 <td class="bibtexitem">
 Y.&nbsp;Wu, M.&nbsp;Schuster, Z.&nbsp;Chen, Q.&nbsp;V. Le, M.&nbsp;Norouzi, W.&nbsp;Macherey, M.&nbsp;Krikun,
@@ -81,7 +94,7 @@ Y.&nbsp;Wu, M.&nbsp;Schuster, Z.&nbsp;Chen, Q.&nbsp;V. Le, M.&nbsp;Norouzi, W.&n
 <!-- This document was automatically generated with bibtex2html 1.98
      (see http://www.lri.fr/~filliatr/bibtex2html/),
      with the following command:
-     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf  -->
+     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf -nf data data -nf sound_examples "sound examples"  -->
 
 
 <table>
@@ -341,7 +354,7 @@ U.&nbsp;Alon, G.&nbsp;Pundak, and T.&nbsp;N. Sainath, &ldquo;Contextual speech r
 <!-- This document was automatically generated with bibtex2html 1.98
      (see http://www.lri.fr/~filliatr/bibtex2html/),
      with the following command:
-     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf  -->
+     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf -nf data data -nf sound_examples "sound examples"  -->
 
 
 <table>
@@ -395,7 +408,7 @@ P.&nbsp;Haghani, A.&nbsp;Narayanan, M.&nbsp;Bacchiani, G.&nbsp;Chuang, N.&nbsp;G
 <!-- This document was automatically generated with bibtex2html 1.98
      (see http://www.lri.fr/~filliatr/bibtex2html/),
      with the following command:
-     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf  -->
+     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf -nf data data -nf sound_examples "sound examples"  -->
 
 
 <table>
@@ -410,7 +423,8 @@ J.&nbsp;Shen, R.&nbsp;Pang, R.&nbsp;J. Weiss, M.&nbsp;Schuster, N.&nbsp;Jaitly, 
   Y.&nbsp;Wu, &ldquo;Natural TTS synthesis by conditioning WaveNet on mel spectrogram
   predictions,&rdquo; in <em>Proc. IEEE International Conference on Acoustics,
   Speech, and Signal Processing (ICASSP)</em>, 2018.
-[&nbsp;<a href="https://arxiv.org/abs/1703.10135">pdf</a>&nbsp;]
+[&nbsp;<a href="https://google.github.io/tacotron/publications/tacotron2/index.html">sound examples</a>&nbsp;| 
+<a href="https://arxiv.org/abs/1703.10135">pdf</a>&nbsp;]
 
 </td>
 </tr>
@@ -425,7 +439,8 @@ J.&nbsp;Chorowski, R.&nbsp;J. Weiss, R.&nbsp;A. Saurous, and S.&nbsp;Bengio, &ld
   backpropagation for speech texture generation and voice conversion,&rdquo; in <em>
   Proc. IEEE International Conference on Acoustics, Speech, and Signal
   Processing (ICASSP)</em>, 2018.
-[&nbsp;<a href="https://arxiv.org/abs/1712.08363">pdf</a>&nbsp;]
+[&nbsp;<a href="https://google.github.io/speech_style_transfer/samples.html">sound examples</a>&nbsp;| 
+<a href="https://arxiv.org/abs/1712.08363">pdf</a>&nbsp;]
 
 </td>
 </tr>
@@ -440,7 +455,8 @@ Y.&nbsp;Jia, Y.&nbsp;Zhang, R.&nbsp;J. Weiss, Q.&nbsp;Wang, J.&nbsp;Shen, F.&nbs
   R.&nbsp;Pang, I.&nbsp;Lopez-Moreno, and Y.&nbsp;Wu, &ldquo;Transfer learning from speaker
   verification to multispeaker text-to-speech synthesis,&rdquo; in <em>Advances in
   Neural Information Processing Systems</em>, 2018.
-[&nbsp;<a href="https://arxiv.org/abs/1806.04558">pdf</a>&nbsp;]
+[&nbsp;<a href="https://google.github.io/tacotron/publications/speaker_adaptation/index.html">sound examples</a>&nbsp;| 
+<a href="https://arxiv.org/abs/1806.04558">pdf</a>&nbsp;]
 
 </td>
 </tr>
@@ -455,7 +471,8 @@ W.&nbsp;N. Hsu, Y.&nbsp;Zhang, R.&nbsp;J. Weiss, H.&nbsp;Zen, Y.&nbsp;Wu, Y.&nbs
   Z.&nbsp;Chen, J.&nbsp;Shen, P.&nbsp;Nguyen, and R.&nbsp;Pang, &ldquo;Hierarchical generative modeling
   for controllable speech synthesis,&rdquo; in <em>Proc. International Conference
   on Learning Representations (ICLR)</em>, 2019.
-[&nbsp;<a href="https://arxiv.org/abs/1810.07217">pdf</a>&nbsp;]
+[&nbsp;<a href="https://google.github.io/tacotron/publications/gmvae_controllable_tts/index.html">sound examples</a>&nbsp;| 
+<a href="https://arxiv.org/abs/1810.07217">pdf</a>&nbsp;]
 
 </td>
 </tr>
@@ -474,14 +491,29 @@ W.&nbsp;N. Hsu, Y.&nbsp;Zhang, R.&nbsp;J. Weiss, Y.&nbsp;A. Chung, Y.&nbsp;Wang,
 
 </td>
 </tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="zen2019libritts">6</a>]
+</td>
+<td class="bibtexitem">
+H.&nbsp;Zen, V.&nbsp;Dang, R.&nbsp;Clark, Y.&nbsp;Zhang, R.&nbsp;J. Weiss, Y.&nbsp;Jia, Z.&nbsp;Chen, and Y.&nbsp;Wu,
+  &ldquo;LibriTTS: A corpus derived from LibriSpeech for text-to-speech,&rdquo; in
+  <em>submitted to Interspeech</em>, 2019.
+[&nbsp;<a href="http://www.openslr.org/60">data</a>&nbsp;| 
+<a href="https://arxiv.org/abs/1904.02882">pdf</a>&nbsp;]
+
+</td>
+</tr>
 </table>
 
-## Speech-to-text translation
+## Speech translation
 
 <!-- This document was automatically generated with bibtex2html 1.98
      (see http://www.lri.fr/~filliatr/bibtex2html/),
      with the following command:
-     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf  -->
+     /usr/bin/bibtex2html -s ieeetr -nodoc -nobibsource -nofooter -nf pdf pdf -nf data data -nf sound_examples "sound examples"  -->
 
 
 <table>

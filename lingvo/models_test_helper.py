@@ -19,10 +19,10 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
-from lingvo.core import base_model
 from lingvo.core import base_input_generator
+from lingvo.core import base_model
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 
 
 def _StubOutCreateVariable(variable_cache):
@@ -39,13 +39,21 @@ def _StubOutCreateVariable(variable_cache):
                           init_wrapper=None,
                           collections=None):
     """Return a zero tensor of the right shape instead of creating variable."""
-    del name
     del reuse
-    del trainable
-    del collections
     dtype = params.dtype
     if init_wrapper:
       var = init_wrapper(dtype, tf.constant_initializer(0, dtype=dtype))
+    # For total samples counters we have to actually create variables so that
+    # we can access the 'value' attribute during construction.
+    elif 'total_samples' in name:
+      var = tf.get_variable(
+          name,
+          params.shape,
+          dtype,
+          tf.constant_initializer(0, dtype=dtype),
+          collections=collections,
+          trainable=trainable,
+          validate_shape=True)
     else:
       key = hash(tuple(params.shape))
       if key in variable_cache:
@@ -58,7 +66,7 @@ def _StubOutCreateVariable(variable_cache):
   py_utils.CreateVariable = _CreateVariableStub
 
 
-class BaseModelsTest(tf.test.TestCase):
+class BaseModelsTest(test_utils.TestCase):
   """Base model test class which does not define any test methods of its own."""
 
   def setUp(self):

@@ -56,8 +56,8 @@ from lingvo.core import metrics
 from lingvo.core import py_utils
 
 tf.flags.DEFINE_string(
-    'model', '', 'Name of the model class to train. Must be one of those'
-    ' defined in models.py.')
+    'model', '', 'Name of the model class to train.'
+    'Must be a model defined in the model_registry.')
 tf.flags.DEFINE_string(
     'model_task_name', '', 'For multitask models: '
     'select task to train/evaluate/decode. '
@@ -68,9 +68,9 @@ tf.flags.DEFINE_bool(
     'If True, enter interactive IPython for the controller job.')
 
 tf.flags.DEFINE_string(
-    'run_locally', None,
-    'If True, ignores flags below and runs controller and trainer '
-    'in the single process.')
+    'run_locally', '',
+    'Can be empty, cpu, or gpu. If not empty, ignores cluster configuration '
+    'flags and runs controller and trainer in a single local process.')
 
 tf.flags.DEFINE_string('tf_master', '', 'TF runtime.')
 tf.flags.DEFINE_string(
@@ -223,7 +223,7 @@ class Controller(base_runner.BaseRunner):
   def _Loop(self):
     self._summary_writer.add_graph(self._graph)
     with tf.container(self._container_id), self._GetSession() as sess:
-      gsteps = self._model.global_step
+      gsteps = py_utils.GetGlobalStep()
       examples = self._model.total_examples
 
       if FLAGS.interactive:
@@ -369,8 +369,7 @@ class Controller(base_runner.BaseRunner):
       rate = (s1 - s0) / elapsed_secs
       example_rate = (e1 - e0) / elapsed_secs
     tf.logging.info('Steps/second: %f, Examples/second: %f', rate, example_rate)
-    self._SummarizeValue(current_steps,
-                         '%s/sec' % self._model.global_step.op.name, rate)
+    self._SummarizeValue(current_steps, 'global_step/sec', rate)
     self._SummarizeValue(current_steps, 'examples/sec', example_rate)
     return rate, example_rate
 
@@ -451,7 +450,7 @@ class Trainer(base_runner.BaseRunner):
       def _WaitTillInit():
         """Wait until the model is ready."""
         try:
-          global_step = sess.run(self._model.global_step)
+          global_step = sess.run(py_utils.GetGlobalStep())
         except tf.errors.FailedPreconditionError as e:
           tf.logging.info('Probably the expected race on global_step: %s', e)
           raise
@@ -504,7 +503,7 @@ class Trainer(base_runner.BaseRunner):
 
         _, global_step, eval_metrics, per_example_tensors = sess.run([
             model_task.train_op,
-            self._model.global_step,
+            py_utils.GetGlobalStep(),
             model_task.eval_metrics,
             model_task.per_example_tensors,
         ])
@@ -764,7 +763,8 @@ class TrainerTpu(base_runner.BaseRunner):
           tf.contrib.tpu.initialize_system(embedding_config=None, job=None))
       if FLAGS.run_locally == 'tpu':
         sess.run(tf.global_variables_initializer())
-      global_step, = sess.run([self._model.global_step])
+      gsteps = py_utils.GetGlobalStep()
+      global_step = sess.run(gsteps)
       self._initialized.set()
       eval_metrics = None
 
@@ -786,9 +786,9 @@ class TrainerTpu(base_runner.BaseRunner):
 
         # Note: global_step is incremented by self._steps_per_loop by the
         # previous sess.run call.
-        global_step, = sess.run([self._model.global_step])
+        global_step = sess.run(gsteps)
 
-        msg = 'step:%6d' % (global_step)
+        msg = 'step:%6d' % global_step
         for key, (val, _) in sorted(six.iteritems(eval_metrics)):
           msg += ' %s:%.8g' % (key, val)
           self._SummarizeValue(global_step, key, val)
@@ -890,7 +890,7 @@ class Evaler(base_runner.BaseRunner):
     if not FLAGS.evaler_in_same_address_as_controller:
       self._LoadCheckpointForEval(sess, path)
 
-    global_step = sess.run(self._model.global_step)
+    global_step = sess.run(py_utils.GetGlobalStep())
     metrics_dict = {
         name: metrics.AverageMetric() for name in self._model_task.eval_metrics
     }
@@ -987,8 +987,11 @@ class Decoder(base_runner.BaseRunner):
         # tasks, which may result in different node names being chosen.
         # Obviously, variable names has to be stay the same between train and
         # decode.
-        input_batch = (
-            self._model_task.input_generator.GetPreprocessedInputBatch())
+        cluster = self._cluster
+        with tf.device(cluster.input_device):
+          input_batch = (
+              self._model_task.input_generator.GetPreprocessedInputBatch())
+
         self._dec_output = self._model_task.Decode(input_batch)
         self._saver = self._GetSaver()
         self._summary_op = tf.summary.merge_all()
@@ -1041,7 +1044,7 @@ class Decoder(base_runner.BaseRunner):
       samples_per_summary = p.eval.samples_per_summary
     self._LoadCheckpointForEval(sess, checkpoint_path)
 
-    global_step = sess.run(self._model.global_step)
+    global_step = sess.run(py_utils.GetGlobalStep())
     dec_metrics = self._model_task.CreateDecoderMetrics()
     buffered_decode_out = []
     num_examples_metric = dec_metrics['num_samples_in_batch']

@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import math
+import numbers
 import numpy as np
 import six
 from six.moves import range
@@ -28,6 +29,8 @@ from tensorflow.python.framework import function
 from tensorflow.python.ops import functional_ops
 from tensorflow.python.ops import inplace_ops
 from lingvo.core import base_layer
+from lingvo.core import bn_layers
+from lingvo.core import conv_layers_with_time_padding
 from lingvo.core import py_utils
 from lingvo.core import quant_utils
 from lingvo.core import recurrent
@@ -57,7 +60,8 @@ _ACTIVATIONS = {
     'RELU6': tf.nn.relu6,
     'SIGMOID': tf.sigmoid,
     'TANH': tf.tanh,
-    'GELU': Gelu
+    'GELU': Gelu,
+    'SWISH': tf.nn.swish,
 }
 
 # A subset of activation functions are supported by TFLite as fused activation
@@ -99,301 +103,13 @@ class IdentityLayer(base_layer.BaseLayer):
     return py_utils.NestedMap(flops=0, out_shapes=(inputs,))
 
 
-class BatchNormLayer(base_layer.BaseLayer):
-  """Batch normalization layer."""
-
-  @classmethod
-  def Params(cls):
-    p = super(BatchNormLayer, cls).Params()
-    p.Define('dim', 0, 'Depth of the input/output.')
-    p.Define(
-        'decay', 0.999,
-        'Decay in updating the mean and variance moving average used in'
-        ' batch normalization.')
-    p.Define(
-        'enable_cross_replica_sum_on_tpu', True,
-        'If true, calls cross_replica_sum to the aggregate moving averages'
-        ' across all replicas.')
-    p.Define(
-        'use_moving_avg_in_training', False,
-        'If True, use global moving avg (mean, variance) during training'
-        ' to avoid mismatch between train and eval, which then'
-        ' essentially acts as an adaptive normalization step.')
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(BatchNormLayer, self).__init__(params)
-    p = self.params
-    assert p.name
-
-    pc = py_utils.WeightParams(
-        shape=[p.dim],
-        init=py_utils.WeightInit.Constant(0.0),
-        dtype=p.dtype,
-        collections=[self.__class__.__name__ + '_vars'])
-
-    with tf.variable_scope(p.name):
-      if not p.use_moving_avg_in_training:
-        self.CreateVariable('beta', pc)
-        # Note, The real gamma to use is 1 + gamma.
-        self.CreateVariable('gamma', pc, lambda x: 1.0 + x)
-
-      # Two statistics.
-      _, self._moving_mean = py_utils.CreateVariable(
-          'moving_mean', pc, trainable=False)
-
-      pc = py_utils.WeightParams(
-          shape=[p.dim],
-          init=py_utils.WeightInit.Constant(1.0),
-          dtype=p.dtype,
-          collections=[self.__class__.__name__ + '_vars'])
-      _, self._moving_variance = py_utils.CreateVariable(
-          'moving_variance', pc, trainable=False)
-    self._epsilon = 0.001
-    self._decay = p.decay
-
-  @property
-  def epsilon(self):
-    return self._epsilon
-
-  @staticmethod
-  def _Moments(inputs, mask, enable_cross_replica_sum_on_tpu=False):
-    """Computes mean and variance over the valid data points in inputs."""
-    inputs = py_utils.with_dependencies([
-        py_utils.assert_equal(tf.rank(inputs), tf.rank(mask)),
-        py_utils.assert_greater_equal(mask, tf.zeros_like(mask)),
-    ], inputs)
-    rank = tf.rank(mask)
-    reduce_over_dims = tf.range(0, rank - 1)
-    sum_v = tf.reduce_sum(inputs * tf.cast(mask, inputs.dtype),
-                          reduce_over_dims)
-    count_v = tf.reduce_sum(mask, reduce_over_dims)
-    # Input shape is guaranteed to be a multiple of mask shape because the
-    # inputs * mask op above was successfully broadcasted.
-    mask_multiplier = tf.shape(inputs)[:-1] // tf.shape(mask)[:-1]
-    count_v *= tf.cast(tf.reduce_prod(mask_multiplier), count_v.dtype)
-    if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
-      sum_v = tf.contrib.tpu.cross_replica_sum(sum_v)
-      count_v = tf.contrib.tpu.cross_replica_sum(count_v)
-
-    count_v = tf.maximum(count_v, 1.0)
-    mean = sum_v / count_v
-    sum_vv = tf.reduce_sum((inputs - mean) * (inputs - mean) * mask,
-                           reduce_over_dims)
-
-    if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
-      sum_vv = tf.contrib.tpu.cross_replica_sum(sum_vv)
-
-    variance = py_utils.with_dependencies([
-        py_utils.assert_greater_equal(sum_vv, tf.zeros_like(sum_vv)),
-    ], sum_vv / count_v)
-    return mean, variance
-
-  def _GetDefaultPaddings(self, inputs):
-    """Gets the default paddings for an input."""
-    return tf.zeros(
-        tf.concat([tf.shape(inputs)[:-1], [1]], 0), dtype=inputs.dtype)
-
-  def GetCurrentMoments(self, theta):
-    """Gets the current computed moments, which should be applied at eval.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-      paddings: The paddings tensor.  Shaped [..., 1], with the same rank as the
-        input tensor.
-
-    Returns:
-      Tuple of (mean, variance, beta, gamma).
-    """
-    p = self.params
-    if p.use_moving_avg_in_training:
-      return self._moving_mean, self._moving_variance, 0.0, 1.0
-    else:
-      return self._moving_mean, self._moving_variance, theta.beta, theta.gamma
-
-  def ComputeAndUpdateMoments(self, theta, inputs, paddings=None):
-    """Computes moments and updates state.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-      paddings: The paddings tensor.  Shaped [..., 1], with the same rank as the
-        input tensor.
-
-    Returns:
-      Tuple of (mean, variance, beta, gamma).
-    """
-    p = self.params
-    if paddings is None:
-      paddings = self._GetDefaultPaddings(inputs)
-    inputs = py_utils.with_dependencies([
-        py_utils.assert_shape_match([tf.shape(inputs)[-1]], [p.dim]),
-        py_utils.assert_shape_match([tf.shape(paddings)[-1]], [1]),
-    ], inputs)
-    with tf.name_scope(p.name):
-      if p.is_eval:
-        # The mean and variance used for normalization.
-        norm_mean, norm_variance = self._moving_mean, self._moving_variance
-      else:
-        mean, variance = self._Moments(inputs, 1.0 - paddings,
-                                       p.enable_cross_replica_sum_on_tpu)
-
-        py_utils.UpdateBatchNormVars(self._moving_mean, mean, self._decay)
-        py_utils.UpdateBatchNormVars(self._moving_variance, variance,
-                                     self._decay)
-        # Add some summaries for visualization.
-        summary_utils.histogram('%s_mean' % p.name, tf.cast(mean, tf.float32))
-        summary_utils.histogram('%s_variance' % p.name,
-                                tf.cast(variance, tf.float32))
-        summary_utils.histogram('%s_moving_mean' % p.name,
-                                tf.cast(self._moving_mean, tf.float32))
-        summary_utils.histogram('%s_moving_variance' % p.name,
-                                tf.cast(self._moving_variance, tf.float32))
-        summary_utils.histogram('%s_mean_diff' % p.name,
-                                tf.cast(mean - self._moving_mean, tf.float32))
-        summary_utils.histogram(
-            '%s_variance_diff' % p.name,
-            tf.cast(variance - self._moving_variance, tf.float32))
-        if p.use_moving_avg_in_training:
-          # Use the global statistics for normalization.
-          # Control dependencies on mean and variance make sure
-          # moving_mean and variance will be updated for every training step.
-          norm_mean = py_utils.with_dependencies([mean], self._moving_mean)
-          norm_variance = py_utils.with_dependencies([variance],
-                                                     self._moving_variance)
-        else:
-          # Use the batch statistics for normalization.
-          norm_mean = mean
-          norm_variance = variance
-
-      norm_mean = py_utils.CheckNumerics(
-          norm_mean, 'mean of %s failed numeric check' % p.name)
-      norm_variance = py_utils.CheckNumerics(
-          norm_variance, 'variance of %s failed numeric check' % p.name)
-
-      if p.use_moving_avg_in_training:
-        beta = 0.0
-        gamma = 1.0
-      else:
-        beta = theta.beta
-        gamma = theta.gamma
-      return norm_mean, norm_variance, beta, gamma
-
-  def FProp(self, theta, inputs, paddings=None):
-    """Apply batch normalization.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-      paddings: The paddings tensor.  Shaped [..., 1], with the same rank as the
-        input tensor.
-
-    Returns:
-      Output after applying batch normalization, with the same shape as
-      'inputs'.
-    """
-    p = self.params
-    if paddings is None:
-      paddings = self._GetDefaultPaddings(inputs)
-    with tf.name_scope(p.name):
-      norm_mean, norm_variance, beta, gamma = self.ComputeAndUpdateMoments(
-          theta, inputs, paddings)
-      with tf.control_dependencies([
-          py_utils.assert_greater_equal(norm_variance,
-                                        tf.zeros_like(norm_variance)),
-          py_utils.assert_shape_match([p.dim], tf.shape(norm_mean)),
-          py_utils.assert_shape_match([p.dim], tf.shape(norm_variance)),
-      ]):
-        bn_output = tf.nn.batch_normalization(inputs, norm_mean, norm_variance,
-                                              beta, gamma, self._epsilon)
-      bn_output *= 1.0 - paddings
-      return bn_output
-
-  @classmethod
-  def FPropMeta(cls, p, inputs, padding=None):
-    py_utils.CheckShapes((inputs,))
-    flops_per_element = 10  # Approximately 10 flops per element.
-    return py_utils.NestedMap(
-        flops=inputs.num_elements() * flops_per_element, out_shapes=(inputs,))
-
-
-def _ComputeConvOutputShape(in_shape,
-                            t_stride,
-                            f_stride,
-                            outc=None,
-                            padding='SAME'):
-  """Computes output shape for convolution and pooling layers.
-
-  If `in_shape` is a dynamic shape, the output will be Tensors, while if
-  `in_shape` is a list of ints then the output will also be a list of ints.
-
-  Args:
-    in_shape: A length 4 Tensor or list representing the input shape.
-    t_stride: The stride along the time dimension.
-    f_stride: The stride along the frequency dimension.
-    outc: The expected output channel. If None, will use the input channel.
-    padding: 'SAME' or 'VALID'.
-
-  Returns:
-    The expected output shape.
-  """
-  # In the order of batch, time, frequency, channel
-  n = in_shape[0]
-  t = in_shape[1]
-  f = in_shape[2]
-  c = in_shape[3]
-  # Last two dimensions has to be specified.
-  assert f is not None and c is not None
-  if padding == 'VALID':
-    if t:
-      t -= t_stride - 1
-    f -= f_stride - 1
-  ot = t
-  if ot is not None:
-    ot = (ot + t_stride - 1) // t_stride
-  of = (f + f_stride - 1) // f_stride
-  if outc is None:
-    outc = c
-  return [n, ot, of, outc]
-
-
-def _ComputeConvOutputPadding(paddings,
-                              window,
-                              stride,
-                              padding_algorithm='SAME'):
-  """Computes paddings for convolution and pooling output.
-
-  out_padding[i] == 1 iff any in_padding corresponding to that output is 1.
-
-  Args:
-    paddings: The paddings tensor. It is expected to be of shape [batch, time].
-    window: The size of the windows.
-    stride: The time-stride between adjacent windows.
-    padding_algorithm: 'SAME' or 'VALID'.
-
-  Returns:
-    out_padding, The new padding tensor of size [batch, ceil(time / stride)].
-  """
-  if stride == 1:
-    return paddings
-
-  # Pad so input_length divides stride.
-  input_length = py_utils.GetShape(paddings)[1]
-  pad_len = (input_length + stride - 1) // stride * stride - input_length
-  paddings = tf.pad(paddings, [[0, 0], [0, pad_len]], constant_values=1.0)
-  out_padding = tf.nn.pool(
-      tf.expand_dims(paddings, -1),
-      [window],
-      'MAX',
-      padding_algorithm,
-      strides=[stride],
-  )
-  return tf.squeeze(out_padding, -1)
+# TODO(yonghui/jonathanasdf): Remove the forwarded links.
+_ComputeConvOutputShape = conv_layers_with_time_padding.ComputeConvOutputShape
+_ComputeConvOutputPadding = (
+    conv_layers_with_time_padding.ComputeConvOutputPadding)
+BatchNormLayer = bn_layers.BatchNormLayer
+BatchNormLayerNoPadding = bn_layers.BatchNormLayerNoPadding
+AddingAccumulator = bn_layers.AddingAccumulator
 
 
 class BaseConv2DLayer(quant_utils.QuantizableLayer):
@@ -758,8 +474,8 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
         # NOTE: this may be slightly inaccurate when p.dilation_rate[0] > 1.
         # But there's likely no real problems. Trying to set it gives an error:
         # pooling with SAME padding is not implemented for dilation_rate > 1.
-        # NOTE: we use window=p.filter_stride[0] to be compatible with legacy
-        # implementation.  Consider updating it to be the actual shape.
+        # NOTE: window=p.filter_stride[0] means output i will be padded if any
+        # input in the stride between the two conv centers are padded.
         conv_padding = _ComputeConvOutputPadding(
             paddings, window=p.filter_stride[0], stride=p.filter_stride[0])
 
@@ -2365,15 +2081,28 @@ class DropoutLayer(base_layer.BaseLayer):
   def Params(cls):
     p = super(DropoutLayer, cls).Params()
     p.Define('keep_prob', 1.0, 'Keep probability.')
+    # noise_shape is unknown when building layer params.
     p.Define(
         'noise_shape', None, 'A 1-D `Tensor` of type `int32`, representing'
         ' the shape for randomly generated keep/drop flags.')
+    p.Define(
+        'noise_shape_broadcast_dims', None,
+        'A list of dimension where the noise shape is broadcasted. For '
+        'example, noise_shape = [n, h, w, 1] when '
+        'noise_shape_broadcast_dims=[-1] ')
     # We typically want to replace dropout by expectation during eval.
     # However, in certain cases E(f(x)) != f(E(x)), and replacing dropout by its
     # expectation during eval leads to worse quality.
     p.Define('dropout_at_eval', False,
              'Whether or not to also perform dropout at eval time.')
     return p
+
+  def _Dropout(self, theta, inputs, noise_shape):
+    return tf.nn.dropout(
+        inputs,
+        keep_prob=self.params.keep_prob,
+        noise_shape=noise_shape,
+        seed=self.params.random_seed)
 
   def FProp(self, theta, inputs):
     """Apply dropout to inputs.
@@ -2387,12 +2116,20 @@ class DropoutLayer(base_layer.BaseLayer):
       inputs with dropout applied at training time.
     """
     p = self.params
-    if p.keep_prob < 1.0 and (not p.is_eval or p.dropout_at_eval):
-      return tf.nn.dropout(
-          inputs,
-          keep_prob=p.keep_prob,
-          noise_shape=p.noise_shape,
-          seed=p.random_seed)
+    if not p.is_eval or p.dropout_at_eval:
+      if isinstance(p.keep_prob, numbers.Real) and p.keep_prob == 1.0:
+        return inputs
+      if p.noise_shape_broadcast_dims:
+        noise_shape = p.noise_shape or py_utils.GetShape(inputs)
+        for dim in p.noise_shape_broadcast_dims:
+          if dim >= len(noise_shape):
+            raise ValueError('Invalid broadcasted dim {}'.format(dim))
+          noise_shape[dim] = 1
+      else:
+        noise_shape = p.noise_shape
+      ret = self._Dropout(theta, inputs, noise_shape)
+      ret.set_shape(inputs.get_shape())
+      return ret
     else:
       return inputs
 
@@ -2404,37 +2141,15 @@ class DropoutLayer(base_layer.BaseLayer):
         flops=inputs.num_elements() * flops_per_element, out_shapes=(inputs,))
 
 
-class DeterministicDropoutLayer(base_layer.BaseLayer):
+class DeterministicDropoutLayer(DropoutLayer):
   """Apply dropout during trainig."""
 
-  @classmethod
-  def Params(cls):
-    p = super(DeterministicDropoutLayer, cls).Params()
-    p.Define('keep_prob', 1.0, 'Keep probability.')
-    # We typically want to replace dropout by expectation during eval.
-    # However, in certain cases E(f(x)) != f(E(x)), and replacing dropout by its
-    # expectation during eval leads to worse quality.
-    p.Define('dropout_at_eval', False,
-             'Whether or not to also perform dropout at eval time.')
-    return p
-
-  def FProp(self, theta, inputs):
-    """Apply dropout to inputs.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.
-
-    Returns:
-      inputs with dropout applied at training time.
-    """
-    p = self.params
-    if p.keep_prob < 1.0 and (not p.is_eval or p.dropout_at_eval):
-      return py_utils.DeterministicDropout(inputs, p.keep_prob,
-                                           py_utils.GenerateStepSeedPair(p))
-    else:
-      return inputs
+  def _Dropout(self, theta, inputs, noise_shape):
+    return py_utils.DeterministicDropout(
+        inputs,
+        keep_prob=self.params.keep_prob,
+        seeds=py_utils.GenerateStepSeedPair(self.params, theta.global_step),
+        noise_shape=noise_shape)
 
 
 class LayerNorm(base_layer.BaseLayer):

@@ -29,11 +29,9 @@ from lingvo.tasks.lm import layers as lm_layers
 FLAGS = tf.flags.FLAGS
 
 
-class RnnLmNoEmbeddingTest(tf.test.TestCase):
+class RnnLmNoEmbeddingTest(test_utils.TestCase):
 
-  def testBasic(self):
-    time, batch, dims, vocab = 5, 3, 6, 8
-
+  def _testParams(self, dims, vocab):
     p = lm_layers.RnnLmNoEmbedding.Params()
     p.name = 'rnnlm'
     p.vocab_size = vocab
@@ -41,6 +39,11 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
     p.rnns.cell_tpl.num_input_nodes = dims
     p.softmax.input_dim = dims
     p.softmax.num_classes = vocab
+    return p
+
+  def testBasic(self):
+    time, batch, dims, vocab = 5, 3, 6, 8
+    p = self._testParams(dims, vocab)
 
     with self.session(use_gpu=True) as sess:
       lm = p.cls(p)
@@ -70,15 +73,10 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
 
   def testProjection(self):
     time, batch, dims, proj, vocab = 5, 3, 6, 4, 8
-
-    p = lm_layers.RnnLmNoEmbedding.Params()
-    p.name = 'rnnlm'
-    p.vocab_size = vocab
+    p = self._testParams(dims, vocab)
     p.rnns.cell_tpl.num_output_nodes = proj
     p.rnns.cell_tpl.num_hidden_nodes = dims
-    p.rnns.cell_tpl.num_input_nodes = dims
     p.softmax.input_dim = proj
-    p.softmax.num_classes = vocab
 
     with self.session(use_gpu=True) as sess:
       lm = p.cls(p)
@@ -108,15 +106,8 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
 
   def testBasicGrad(self):
     time, batch, dims, vocab = 5, 3, 6, 8
-
-    p = lm_layers.RnnLmNoEmbedding.Params()
+    p = self._testParams(dims, vocab)
     p.dtype = tf.float64
-    p.name = 'rnnlm'
-    p.vocab_size = vocab
-    p.rnns.cell_tpl.num_output_nodes = dims
-    p.rnns.cell_tpl.num_input_nodes = dims
-    p.softmax.input_dim = dims
-    p.softmax.num_classes = vocab
 
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
       lm = p.cls(p)
@@ -150,15 +141,8 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
 
   def testDirectFeatures(self,):
     time, batch, dims, vocab = 5, 3, 6, 8
+    p = self._testParams(dims, vocab)
     direct_features_dim = 4
-
-    p = lm_layers.RnnLmNoEmbedding.Params()
-    p.name = 'rnnlm'
-    p.vocab_size = vocab
-    p.rnns.cell_tpl.num_output_nodes = dims
-    p.rnns.cell_tpl.num_input_nodes = dims
-    p.softmax.num_classes = vocab
-
     p.direct_features_dim = direct_features_dim
     p.softmax.input_dim = dims + direct_features_dim
 
@@ -194,8 +178,47 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
       self.assertAllEqual(xent_output_val.per_example_argmax,
                           np.argmax(xent_output_val.logits, axis=-1))
 
+  def testCombineStates(self):
+    time, batch, dims, vocab = 5, 3, 6, 8
+    p = self._testParams(dims, vocab)
 
-class RnnLmTest(tf.test.TestCase):
+    with self.session(use_gpu=True) as sess:
+      lm = p.cls(p)
+      np.random.seed(12345)
+      inputs = np.random.normal(size=[time, batch, dims])
+      inputs = tf.constant(inputs, tf.float32)
+      paddings = np.zeros([time, batch])
+      paddings[-1] = 1.0
+      paddings = tf.constant(paddings, tf.float32)
+      targets = tf.constant(
+          np.random.randint(vocab, size=(time, batch)), tf.int32)
+      sess.run(tf.global_variables_initializer())
+
+      state0 = lm.zero_state(batch)
+      _, state1 = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          state0=state0,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+      switch = tf.constant([True, True, False], dtype=tf.bool)
+      combined_state = lm.CombineStates(state0, state1, switch)
+      state0_val, state1_val, combined_state_val = sess.run(
+          [state0, state1, combined_state])
+
+      print('state1_val', state1_val)
+      print('combined_state_val', combined_state_val)
+      combined_m_state = combined_state_val.rnn[0].m
+      combined_c_state = combined_state_val.rnn[0].c
+      self.assertAllEqual(combined_m_state[0], state0_val.rnn[0].m[0])
+      self.assertAllEqual(combined_c_state[0], state0_val.rnn[0].c[0])
+      self.assertAllEqual(combined_m_state[1], state0_val.rnn[0].m[1])
+      self.assertAllEqual(combined_c_state[1], state0_val.rnn[0].c[1])
+      self.assertAllEqual(combined_m_state[2], state1_val.rnn[0].m[2])
+      self.assertAllEqual(combined_c_state[2], state1_val.rnn[0].c[2])
+
+
+class RnnLmTest(test_utils.TestCase):
 
   def testBasic(self):
     time, batch, dims, vocab = 5, 3, 6, 8
@@ -333,7 +356,7 @@ class RnnLmTest(tf.test.TestCase):
         self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
 
 
-class ConditionalRnnLmTest(tf.test.TestCase):
+class ConditionalRnnLmTest(test_utils.TestCase):
 
   def testBasic(self):
     time, batch, dims, vocab, condition_dim = 5, 3, 6, 8, 7
@@ -483,7 +506,7 @@ class ConditionalRnnLmTest(tf.test.TestCase):
         self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
 
 
-class MoeLmTest(tf.test.TestCase):
+class MoeLmTest(test_utils.TestCase):
 
   def _MoeLmParams(self, vocab, shared_emb, add_postgating_rnn=True):
     p = lm_layers.MoeLm.Params()
@@ -625,7 +648,7 @@ class MoeLmTest(tf.test.TestCase):
             grad_numeric.reshape([-1])[::step])
 
 
-class TransformerLmNoEmbeddingTest(tf.test.TestCase):
+class TransformerLmNoEmbeddingTest(test_utils.TestCase):
 
   def _testParams(self, dtype=tf.float32):
     model_dim, hidden_dim, vocab_size = 4, 6, 8
@@ -722,7 +745,7 @@ class TransformerLmNoEmbeddingTest(tf.test.TestCase):
       self.assertAllClose(logits1_v, logits2_v)
 
 
-class TransformerLmTest(tf.test.TestCase):
+class TransformerLmTest(test_utils.TestCase):
 
   def testBasic(self):
     time, batch, dims, hidden_dim, vocab = 5, 3, 6, 4, 8
@@ -861,7 +884,7 @@ class TransformerLmTest(tf.test.TestCase):
         self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
 
 
-class GPipeTransformerLmNoEmbeddingTest(tf.test.TestCase):
+class GPipeTransformerLmNoEmbeddingTest(test_utils.TestCase):
 
   def _testParams(self, dtype=tf.float32):
     model_dim, hidden_dim, vocab_size = 4, 6, 8
@@ -933,7 +956,7 @@ class GPipeTransformerLmNoEmbeddingTest(tf.test.TestCase):
         self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
 
 
-class GPipeTransformerLmTest(tf.test.TestCase):
+class GPipeTransformerLmTest(test_utils.TestCase):
 
   def _testParams(self, batch, dims, hidden_dim, vocab):
     p = lm_layers.GPipeTransformerLm.Params()

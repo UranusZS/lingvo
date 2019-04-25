@@ -7,12 +7,12 @@ licenses(["notice"])  # Apache 2.0
 load(
     "//lingvo:lingvo.bzl",
     "custom_kernel_library",
+    "gen_op_cclib",
+    "gen_op_pylib",
     "lingvo_cc_library",
     "lingvo_cc_test",
     "lingvo_proto_cc",
     "lingvo_proto_py",
-    "gen_op_cclib",
-    "gen_op_pylib",
 )
 
 cc_library(
@@ -82,6 +82,7 @@ py_test(
     deps = [
         ":py_x_ops",
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -91,11 +92,13 @@ lingvo_cc_library(
         "record_batcher.cc",
         "record_debug.cc",
         "record_yielder.cc",
+        "sequential_record_yielder.cc",
         "weighted_mix_record_yielder.cc",
     ],
     hdrs = [
         "record_batcher.h",
         "record_yielder.h",
+        "sequential_record_yielder.h",
         "weighted_mix_record_yielder.h",
     ],
     deps = [
@@ -154,6 +157,7 @@ py_test(
     deps = [
         ":py_x_ops",
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -178,6 +182,7 @@ py_test(
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -208,6 +213,7 @@ py_test(
         ":py_x_ops",
         # Implicit tensorflow dependency.
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -229,6 +235,7 @@ py_test(
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         # Implicit tensorflow python framework_for_generated_wrappers dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -247,6 +254,7 @@ py_test(
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -266,6 +274,7 @@ py_test(
         ":py_x_ops",
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -298,6 +307,7 @@ py_test(
         ":py_x_ops",
         # Implicit tensorflow dependency.
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 

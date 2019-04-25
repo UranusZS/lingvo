@@ -21,6 +21,7 @@ from __future__ import print_function
 import contextlib
 import hashlib
 import math
+import numbers
 import re
 import traceback
 
@@ -34,6 +35,7 @@ from tensorflow.contrib.model_pruning.python.layers import core_layers as prunin
 from tensorflow.contrib.tpu.python.tpu import tpu
 from tensorflow.contrib.tpu.python.tpu import tpu_function
 from tensorflow.core.protobuf import rewriter_config_pb2
+from tensorflow.python.framework import function
 from tensorflow.python.util import deprecation
 from lingvo.core import hyperparams
 from lingvo.core import retry
@@ -50,6 +52,8 @@ tf.flags.DEFINE_bool('print_debug_tensors', False,
 
 tf.flags.DEFINE_string(
     'xla_device', '', 'If non-empty, can be cpu, gpu, or tpu (case sensitive)')
+
+tf.flags.DEFINE_bool('nas_run', False, 'If True, this is a NAS training run.')
 
 tf.flags.DEFINE_bool(
     'use_resource_var', False,
@@ -218,7 +222,7 @@ def Log(value, prefix, **kwargs):
 
 
 def _Save(steps, prefix, key, val):
-  filename = '%s.%08d.%s.npy' % (prefix, steps, key)
+  filename = '%s.%08d.%s.npy' % (prefix.decode(), steps, key.decode())
   with tf.gfile.Open(filename, 'w') as outfile:
     np.save(outfile, val)
 
@@ -242,7 +246,7 @@ def Save(value, filename_prefix, **kwargs):
     value is returned.
   """
   last = value
-  steps = GetOrCreateGlobalStep()
+  steps = GetGlobalStep()
   for k in sorted(kwargs):
     with tf.control_dependencies([last]):
       last = tf.py_func(_Save, [steps, filename_prefix, k, kwargs[k]], [])
@@ -268,8 +272,8 @@ def HasShape(tensor, expected_shape):
   """Syntactic sugar for asserting that tensor has the expected shape."""
   if FLAGS.enable_asserts:
     filepath, line, func, _ = traceback.extract_stack(limit=3)[-2]
-    msg = 'LINGVO ASSERT %s:%s(%s)' % (re.sub(r'.*/', '', filepath), line,
-                                          func)
+    msg = 'LINGVO ASSERT %s:%s(%s)' % (re.sub(r'.*/', '',
+                                                 filepath), line, func)
     return with_dependencies([
         py_x_ops.assert_shape_match(tf.shape(tensor), expected_shape, msg=msg)
     ], tensor)
@@ -314,6 +318,10 @@ def use_tpu():  # pylint: disable=invalid-name
   if res:
     assert not FLAGS.enable_asserts  # asserts not supported on tpu
   return res
+
+
+def nas_run():  # pylint: disable=invalid-name
+  return FLAGS.nas_run
 
 
 def tpu_compat():  # pylint: disable=invalid-name
@@ -419,8 +427,8 @@ class NestedMap(dict):
     try:
       return super(NestedMap, self).__getattribute__(key)
     except AttributeError as e:
-      raise AttributeError(
-          '%s; available attributes: %s' % (e, self.__dict__.keys()))
+      raise AttributeError('%s; available attributes: %s' %
+                           (e, self.__dict__.keys()))
 
   def copy(self):  # Don't delegate w/ super: dict.copy() -> dict.
     return NestedMap(self)
@@ -681,6 +689,64 @@ def ReadOnlyAttrDictView(backing):
   return Wrapper()
 
 
+class RNNCellStateInit(object):
+  """State initialization functions for RNN cell init state."""
+
+  @staticmethod
+  def _Params(method, seed):
+    p = hyperparams.Params()
+    p.Define('method', method,
+             'Initialization method. Should be one of zeros, random_normal.')
+    p.Define('seed', seed, 'Random seed used to generate initial values.')
+    p.Freeze()
+    return p
+
+  @staticmethod
+  def Zeros():
+    """tf.zeros()."""
+    return RNNCellStateInit._Params('zeros', seed=None)
+
+  @staticmethod
+  def RandomNormal(seed=None):
+    """tf.random.normal()."""
+    return RNNCellStateInit._Params('random_normal', seed)
+
+
+def DefaultRNNCellStateInit():
+  return RNNCellStateInit.Zeros()
+
+
+def InitRNNCellState(shape, init=None, dtype=None, name=None):
+  """Initial state definitions for RNN cell implementations.
+
+  Args:
+    shape: A array of ints for specifying the shape of the state.
+    init: Hyperparameters as returned by one of the static implemetaitons in
+      RNNCellStateInit.
+    dtype: The dype of the states. Defaults to tf.float32.
+    name: An optional name for the operation.
+
+  Returns:
+    A Tensor of the specified shape, and sampled from the distribution as
+    defined by the init parameters.
+  """
+  if init is None:
+    init = DefaultRNNCellStateInit()
+  if dtype is None:
+    dtype = tf.float32
+
+  method = init.method
+  if method in ['zeros']:
+    init_state = tf.zeros(shape=shape, dtype=dtype, name=name)
+  elif method in ['random_normal']:
+    init_state = tf.random.normal(
+        shape=shape, dtype=dtype, name=name, seed=init.seed)
+  else:
+    raise ValueError('zero_state method (%s) not supported.' % method)
+
+  return init_state
+
+
 class WeightInit(object):
   """Static class providing weight initialization config params."""
 
@@ -734,6 +800,16 @@ class WeightInit(object):
     return WeightInit._Params('gaussian_sqrt_dim', scale, seed)
 
   @staticmethod
+  def GaussianSqrtFanIn(scale=1.0, seed=None):
+    """scale * tf.random_normal(0, 1 / sqrt(fan_in))."""
+    return WeightInit._Params('gaussian_sqrt_fanin', scale, seed)
+
+  @staticmethod
+  def GaussianSqrtFanOut(scale=1.0, seed=None):
+    """scale * tf.random_normal(0, 1 / sqrt(fan_out))."""
+    return WeightInit._Params('gaussian_sqrt_fanout', scale, seed)
+
+  @staticmethod
   def UniformSqrtDim(scale=1.0, seed=None):
     """scale * tf.uniform(-1 / sqrt(dim0), 1 / sqrt(dim0))."""
     return WeightInit._Params('uniform_sqrt_dim', scale, seed)
@@ -747,6 +823,16 @@ class WeightInit(object):
   def TruncatedGaussianSqrtDim(scale=1.0, seed=None):
     """scale * tf.truncated_normal(0, 1 / sqrt(dim0))."""
     return WeightInit._Params('truncated_gaussian_sqrt_dim', scale, seed)
+
+  @staticmethod
+  def TruncatedGaussianSqrtFanIn(scale=1.0, seed=None):
+    """scale * tf.truncated_normal(0, 1 / sqrt(fan_in))."""
+    return WeightInit._Params('truncated_gaussian_sqrt_fanin', scale, seed)
+
+  @staticmethod
+  def TruncatedGaussianSqrtFanOut(scale=1.0, seed=None):
+    """scale * tf.truncated_normal(0, 1 / sqrt(fan_out))."""
+    return WeightInit._Params('truncated_gaussian_sqrt_fanout', scale, seed)
 
   @staticmethod
   def KaimingUniformFanInRelu(scale=1.0, seed=None):
@@ -914,6 +1000,24 @@ _ALL_VARS_KEY = ('__lingvo_all_vars',)
 _get_all_vars = _CollectionGetter(_ALL_VARS_KEY, lambda: {})
 
 
+def GetFanInFanOut(shape):
+  """Returns (fan_in, fan_out) of a weight variable of the give shape."""
+  if not shape:
+    return None, None
+  if len(shape) < 1:
+    return 1, 1
+  elif len(shape) == 1:
+    # Following _compute_fans() from TF's init_ops.py.
+    return shape[0], shape[0]
+  else:
+    receptive_field_size = 1
+    for s in shape[:-2]:
+      receptive_field_size *= s
+    fan_in = shape[-2] * receptive_field_size
+    fan_out = shape[-1] * receptive_field_size
+    return fan_in, fan_out
+
+
 # TODO(yonghui): Add support for partitioned Variables.
 def CreateVariable(name,
                    params,
@@ -971,10 +1075,28 @@ def CreateVariable(name,
   if (method in [
       'gaussian_sqrt_dim', 'uniform_sqrt_dim', 'truncated_gaussian_sqrt_dim'
   ]):
+    if len(shape) > 2:
+      # This is probably not the right method to use when len(shape) > 2,
+      # e.g. dim0 will be 3 with a 3x3 conv2d kernel.
+      tf.logging.warn(
+          'Initializing %s of shape %s with method %s: dim0=%s. '
+          'Make sure that it is intended.', name, shape, method, dim0)
     scale *= 1.0 / math.sqrt(dim0)
 
+  if method in ['gaussian_sqrt_fanin', 'truncated_gaussian_sqrt_fanin']:
+    fan_in, _ = GetFanInFanOut(shape)
+    if fan_in is not None:
+      scale *= 1.0 / math.sqrt(fan_in)
+  if method in ['gaussian_sqrt_fanout', 'truncated_gaussian_sqrt_fanout']:
+    _, fan_out = GetFanInFanOut(shape)
+    if fan_out is not None:
+      scale *= 1.0 / math.sqrt(fan_out)
+
   init_dtype = dtype.real_dtype
-  if method in ['gaussian', 'gaussian_sqrt_dim']:
+  if method in [
+      'gaussian', 'gaussian_sqrt_dim', 'gaussian_sqrt_fanin',
+      'gaussian_sqrt_fanout'
+  ]:
     v_init = tf.random_normal_initializer(
         mean=0.0, stddev=scale, seed=seed, dtype=init_dtype)
   elif method in ['uniform', 'uniform_sqrt_dim']:
@@ -986,7 +1108,10 @@ def CreateVariable(name,
   elif method in ['uniform_unit_scaling']:
     v_init = tf.uniform_unit_scaling_initializer(
         factor=scale, seed=seed, dtype=init_dtype)
-  elif method in ['truncated_gaussian', 'truncated_gaussian_sqrt_dim']:
+  elif method in [
+      'truncated_gaussian', 'truncated_gaussian_sqrt_dim',
+      'truncated_gaussian_sqrt_fanin', 'truncated_gaussian_sqrt_fanout'
+  ]:
     v_init = tf.truncated_normal_initializer(
         mean=0.0, stddev=scale, seed=seed, dtype=init_dtype)
   elif method in ['constant']:
@@ -998,18 +1123,7 @@ def CreateVariable(name,
       if not shape:
         raise ValueError(
             '\'shape\' must not be \'None\' or 0 for XavierUniform')
-      if len(shape) < 1:
-        fan_in = 1
-        fan_out = 1
-      elif len(shape) == 1:
-        fan_in = shape[0]
-        fan_out = shape[0]
-      else:
-        receptive_field_size = 1
-        for s in shape[:-2]:
-          receptive_field_size *= s
-        fan_in = shape[-2] * receptive_field_size
-        fan_out = shape[-1] * receptive_field_size
+      fan_in, fan_out = GetFanInFanOut(shape)
       if method == 'xavier':
         limit = math.sqrt(6. / (fan_in + fan_out))
       elif method == 'geo_mean_xavier':
@@ -1119,9 +1233,28 @@ def CreateVariable(name,
 
 global_variable_scope = tf.get_variable_scope()
 
+_GLOBAL_STEP_STACK = []
 
-def GetOrCreateGlobalStep():
-  """Create if needed and return the global_step."""
+
+@contextlib.contextmanager
+def GlobalStepContext(global_step_tensor):
+  _GLOBAL_STEP_STACK.append(global_step_tensor)
+  yield
+  _GLOBAL_STEP_STACK.pop()
+
+
+def GetGlobalStep():
+  """Return the global_step."""
+  if _GLOBAL_STEP_STACK:
+    return _GLOBAL_STEP_STACK[-1]
+  return tf.train.get_global_step()
+
+
+def GetOrCreateGlobalStepVar():
+  """Return the global_step variable, creating it if it does not exist.
+
+  Prefer GetGlobalStep if a tensor rather than a tf.Variable is sufficient.
+  """
   with tf.variable_scope(
       global_variable_scope, use_resource=use_resource_variables()):
     return tf.train.get_or_create_global_step()
@@ -1144,9 +1277,9 @@ def _LogPlacement(label, theta, copy):
   tf.logging.info('=== %s ===', label)
   LogMultiLines(
       label,
-      theta.Pack(
-          [('%s -> %s' % (x[0], x[1]))
-           for x in zip(GetDevices(theta), GetDevices(copy))]).DebugString())
+      theta.Pack([('%s -> %s' % (x[0], x[1]))
+                  for x in zip(GetDevices(theta), GetDevices(copy))
+                 ]).DebugString())
   tf.logging.info('==========')
 
 
@@ -1261,12 +1394,12 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     tf.logging.info('Overriding vars from checkpoint: %s', ckpt_path)
 
     if not isinstance(loading_rules, tuple):
-      raise ValueError(
-          'Loading rules for %s must be a tuple of two lists!' % ckpt_path)
+      raise ValueError('Loading rules for %s must be a tuple of two lists!' %
+                       ckpt_path)
     if len(loading_rules) != 2 or not all(
         isinstance(l, list) for l in loading_rules):
-      raise ValueError(
-          'Loading rules for %s must be a tuple of two lists!' % ckpt_path)
+      raise ValueError('Loading rules for %s must be a tuple of two lists!' %
+                       ckpt_path)
 
     # Filter the model variables to be overridden.
     vars_to_override = [
@@ -1284,15 +1417,18 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
   tf.logging.info('Model variables overridden: %s', vars_overridden)
 
 
-def _ComputeGradientsSimple(loss, all_vars):
+def _ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
+                            colocate_gradients_with_ops, gate_gradients):
   return tf.gradients(
       loss,
       all_vars,
-      aggregation_method=1,  # Tree
-      colocate_gradients_with_ops=True)
+      aggregation_method=grad_aggregation_method,
+      colocate_gradients_with_ops=colocate_gradients_with_ops,
+      gate_gradients=gate_gradients)
 
 
-def _ComputeGradientsTpu(loss, all_vars):
+def _ComputeGradientsTpu(loss, all_vars, grad_aggregation_method,
+                         colocate_gradients_with_ops, gate_gradients):
   """Computes gradients for local loss across whole TPU cluster."""
   # Scale the loss to account for the full batch size.
   shards = tpu_function.get_tpu_context().number_of_shards
@@ -1301,7 +1437,9 @@ def _ComputeGradientsTpu(loss, all_vars):
 
   # Computes the gradients.
   # Sum the grads so that we can compute statistics across the whole batch.
-  all_grads = _ComputeGradientsSimple(loss, all_vars)
+  all_grads = _ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
+                                      colocate_gradients_with_ops,
+                                      gate_gradients)
 
   # NOTE: We can't use tpu_optimizer.CrossShardOptimizer since
   # we need to scale the grads *after* the cross_replica_sum to
@@ -1320,14 +1458,82 @@ def _ComputeGradientsTpu(loss, all_vars):
   return aggregated_grads
 
 
-def ComputeGradients(loss, vmap):
-  """Computes gradients of variables in vmap w.r.t.
+def _ComputeGradientsTpuNas(loss, all_vars, grad_aggregation_method,
+                            colocate_gradients_with_ops, gate_gradients):
+  """Computes gradients for local loss across whole TPU cluster.
 
-  to loss.
+  This implementation specializes for the case where weight params maybe used
+  for different number of times in the forward computation, so that gradients
+  should be normalized by the actual number of times they are being computed.
+
+  TODO(yonghui): Maybe merge this implementation with the _ComputeGradientsTpu
+  one.
+
+  Args:
+    loss: The loss to backprop from.
+    all_vars: Vars with respect to which gradients are to be computed.
+    grad_aggregation_method: aggregation method to use when calling
+      tf.gradients.
+    colocate_gradients_with_ops: boolean, whether or not to colocate gradient op
+      with the original op.
+    gate_gradients: boolean, flag to be passed to tf.gradients.
+
+  Returns:
+    gradients to be passed back.
+  """
+  # Computes the gradients.
+  # Sum the grads so that we can compute statistics across the whole batch.
+  all_grads = _ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
+                                      colocate_gradients_with_ops,
+                                      gate_gradients)
+
+  # NOTE: We can't use tpu_optimizer.CrossShardOptimizer since
+  # we need to scale the grads *after* the cross_replica_sum to
+  # match GPU version!
+
+  # TODO(cwhipkey): should we do something different here? - we could do
+  # some operations on the gradients before the aggregation (see comments in
+  # tensorflow/contrib/tpu/python/tpu/tpu_optimizer.py - see compute_gradients -
+  # for some more details).
+
+  aggregated_grads = []
+  for g in all_grads:
+    if g is not None:
+      with tf.colocate_with(g):
+        # Q(yonghui): Is there a better way to detect a non-zero gradient?
+        # Note(yonghui): gradient of a weight param can be all zero if that
+        # weight param is not used in the forward computation, e.g. as in
+        # switchable layers in neural architecture search.
+        zero_threashold = 1e-8
+        g_is_non_zero = tf.cast(
+            tf.reduce_sum(tf.math.abs(g)) > zero_threashold, g.dtype)
+        num_updates = tf.maximum(
+            tf.contrib.tpu.cross_replica_sum(g_is_non_zero), 1.0)
+        normalized_g = tf.contrib.tpu.cross_replica_sum(g) / num_updates
+        aggregated_grads.append(normalized_g)
+    else:
+      aggregated_grads.append(None)
+  return aggregated_grads
+
+
+def ComputeGradients(
+    loss,
+    vmap,
+    grad_aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE,
+    colocate_gradients_with_ops=True,
+    gate_gradients=False):
+  """Computes gradients of variables in vmap w.r.t loss.
 
   Args:
     loss: A scalar Tensor.
     vmap: A `.NestedMap` of variables.
+    grad_aggregation_method: Specifies the method used to combine gradient
+      terms. Accepted values are constants defined in the class
+      AggregationMethod.
+    colocate_gradients_with_ops: If True, try colocating gradients with the
+      corresponding op.
+    gate_gradients: If True, add a tuple around the gradients returned for an
+      operations. This avoids some race conditions.
 
   Returns:
     var_grad - a `.NestedMap` of (variable, gradient). You can view
@@ -1363,8 +1569,16 @@ def ComputeGradients(loss, vmap):
   filtered_vlist = filtered_vmap.Flatten()
 
   # tpu vs non-tpu is slightly different.
-  take_grad = _ComputeGradientsTpu if use_tpu() else _ComputeGradientsSimple
-  grads = take_grad(loss, filtered_vlist)
+  if use_tpu():
+    if nas_run():
+      take_grad = _ComputeGradientsTpuNas
+    else:
+      take_grad = _ComputeGradientsTpu
+  else:
+    take_grad = _ComputeGradientsSimple
+
+  grads = take_grad(loss, filtered_vlist, grad_aggregation_method,
+                    colocate_gradients_with_ops, gate_gradients)
 
   # Formulate pairs of (var, grad) and pack them into the same
   # structure as filtered_vmap.
@@ -1378,9 +1592,7 @@ def ComputeGradients(loss, vmap):
 
 
 def MaskGradients(var_grad, grad_mask, grad_onehot):
-  """Computes gradients of variables in vmap w.r.t.
-
-  loss.
+  """Computes gradients of non-masked variables in vmap w.r.t loss.
 
   Args:
     var_grad: A `.NestedMap` of (variable, gradient)
@@ -1388,7 +1600,7 @@ def MaskGradients(var_grad, grad_mask, grad_onehot):
     grad_onehot: A 1-hot vector of the current data source selected.
 
   Returns:
-    var_grad - a `.NestedMap` of (variable, mask *  gradient).
+    var_grad - a `.NestedMap` of (variable, mask * gradient).
   """
 
   def ApplyMask(entry):
@@ -1444,6 +1656,40 @@ def ApplyGradMultiplier(vs_gs_scale, grad_scale=None):
   return vs_gs_scale.Transform(Scale)
 
 
+def ApplyGradNormCliping(vs_gs, norm=1.0):
+  """Clip gradients to norm on same device as corresponding variables.
+
+  Args:
+    vs_gs: A `.NestedMap` of (variable, gradient).
+    norm: Each tensor's gradient will be scaled down to have a maximum L2-norm
+      value of `norm`.
+
+  Returns:
+    A `.NestedMap` of (variable, scaled_gradient). In particular, if
+    grad_scale is 0, the result gradient is always 0, even if the input
+    gradient is inf or nan.
+  """
+  vs_gs_norm = vs_gs.Transform(lambda v_g: (v_g[0], v_g[1], norm))
+
+  def ClipByNorm(var, grad, norm):
+    grad = CheckNumerics(grad, 'Gradient for %s is not finite.' % var.name)
+    return tf.clip_by_norm(grad, norm)
+
+  def Clip(item):
+    """Scales the gradient."""
+    var, grad, norm = item
+    assert grad is not None, ('No grad found for ', var.name)
+    with tf.device(var.device):
+      if isinstance(grad, tf.IndexedSlices):
+        grad = tf.IndexedSlices(
+            ClipByNorm(var, grad.values, norm), grad.indices, grad.dense_shape)
+      else:
+        grad = ClipByNorm(var, grad, norm)
+    return (var, grad)
+
+  return vs_gs_norm.Transform(Clip)
+
+
 SKIP_LP_REGULARIZATION = '__lingvo_skip_lp_regularization'
 
 
@@ -1479,12 +1725,16 @@ def AdjustGradientsWithLpLoss(var_grads, lp_regularizer_weight, p=2.0):
   def Skip(v_g):
     return v_g[0] not in tf.get_collection(SKIP_LP_REGULARIZATION)
 
+  filtered_var_grads = var_grads.Filter(Skip)
+  for k, (v, _) in filtered_var_grads.FlattenItems():
+    tf.logging.info('AdjustGradientsWithLpLoss: %s: %s', k, v)
+
   if p == 2.0:
     lp_loss = 0.5 * lp_regularizer_weight * SumSquared(
-        var_grads.Filter(Skip).Transform(GetVar).Flatten())
+        filtered_var_grads.Transform(GetVar).Flatten())
   elif p == 1.0:
     lp_loss = lp_regularizer_weight * SumAbs(
-        var_grads.Filter(Skip).Transform(GetVar).Flatten())
+        filtered_var_grads.Transform(GetVar).Flatten())
 
   def LpGrad(item):
     """Adjusts item's grad w/ Lp loss term."""
@@ -1815,12 +2065,12 @@ def GetStepSeed():
 
 def ResetStepSeed(seed=0):
   """Resets step_seed to specified value."""
+  new_step_seed = tf.convert_to_tensor(seed, dtype=tf.int64)
   step_seed_tensors = tf.get_default_graph().get_collection_ref('step_seed')
   if len(step_seed_tensors) == 1:
-    step_seed_tensors[0] = tf.convert_to_tensor(seed, dtype=tf.int64)
+    step_seed_tensors[0] = new_step_seed
   elif not step_seed_tensors:
-    tf.add_to_collection('step_seed', tf.convert_to_tensor(
-        seed, dtype=tf.int64))
+    tf.add_to_collection('step_seed', new_step_seed)
   else:
     raise ValueError('Multiple tensors in step_seed collection.')
 
@@ -1834,18 +2084,19 @@ def GetIncStepSeed():
   return step_seed
 
 
-def GenerateStepSeedPair(p, op_seed=None):
+def GenerateStepSeedPair(p, global_step, op_seed=None):
   """Generates a seed pair for deterministic random operations in functional loops.
 
   This function retrieves a unique seed pair on each call, based off the current
   global step and step seed. The step seed ensures this function returns a
   unique seed pair on each call: calling this function automatically increments
   the step seed. The step seed is automatically reset at the beginning of each
-  global step in the model's FProp.
+  global step in the model's FProp and works transparently through recurrent.py.
 
   Args:
     p: A hyperparams.Params object, containing keys 'random_seed' and
       'is_inference'.
+    global_step: The global step.
     op_seed: An additional operation-level seed to apply.
 
   Returns:
@@ -1865,7 +2116,7 @@ def GenerateStepSeedPair(p, op_seed=None):
     # inference if the graph is exported with random_seed=None as a workaround.
     return tf.random_uniform([2], maxval=seed_dtype.max, dtype=seed_dtype)
 
-  global_step = tf.cast(GetOrCreateGlobalStep(), seed_dtype)
+  global_step = tf.cast(global_step, seed_dtype)
   step_seed = tf.cast(GetIncStepSeed(), seed_dtype)
   seeds = tf.stack([global_step, step_seed])
 
@@ -1876,14 +2127,16 @@ def GenerateStepSeedPair(p, op_seed=None):
   return seeds
 
 
-def DeterministicDropout(x, keep_prob, seeds, name=None):
+def DeterministicDropout(x, keep_prob, seeds, noise_shape=None, name=None):
   """Similar to `tf.nn.dropout()`, but fully deterministic.
 
   Args:
     x: A float Tensor on which to apply dropout.
-    keep_prob: A scalar of keep probability.
+    keep_prob: A scalar `Tensor` of keep probability.
     seeds: A Tensor of shape [2]. 2 seeds for deterministic random number
       generator.
+    noise_shape: A 1-D `Tensor` of type `int32`, representing the shape for
+      randomly generated keep/drop flags.
     name: An optional name for this operation.
 
   Returns:
@@ -1892,12 +2145,13 @@ def DeterministicDropout(x, keep_prob, seeds, name=None):
   Raises:
     InvalidArgumentError: if keep_prob is invalid.
   """
-  if keep_prob <= 0 or keep_prob > 1:
-    raise tf.errors.InvalidArgumentError(
-        'keep_prob must be in range (0, 1]. Value: {}'.format(keep_prob))
+  if isinstance(keep_prob, numbers.Real):
+    if keep_prob <= 0 or keep_prob > 1:
+      raise tf.errors.InvalidArgumentError(
+          'keep_prob must be in range (0, 1]. Value: {}'.format(keep_prob))
 
-  if keep_prob == 1:
-    return x
+    if keep_prob == 1:
+      return x
   with tf.name_scope(name, 'dropout', [x]) as name:
     if use_tpu():
       seeds = tf.cast(seeds, tf.int32)
@@ -1906,8 +2160,9 @@ def DeterministicDropout(x, keep_prob, seeds, name=None):
     # uniform in [keep_prob, 1.0 + keep_prob)
     # StatelessRandomUniform op does not support non-float (e.g. bfloat16) dtype
     # and non-int32 seed types.
+    noise_shape = noise_shape or GetShape(x)
     random_tensor = keep_prob + tf.contrib.stateless.stateless_random_uniform(
-        GetShape(x), seed=seeds, dtype=tf.float32)
+        noise_shape, seed=seeds, dtype=tf.float32)
     # 0. if [keep_prob, 1.0) and 1. if [1.0, 1.0 + keep_prob)
     binary_tensor = tf.floor(random_tensor)
     if x.dtype != tf.float32:
@@ -2477,3 +2732,59 @@ def SequencesToDebugStrings(ids, lens, summarize=5):
       _Body, (i0, result0),
       shape_invariants=(i0.shape, tf.TensorShape([None])))
   return strs
+
+
+def RematerializeFn(fn, *xs):
+  """Calls fn and rematerializes fn in the backward pass.
+
+  fn(*xs) -> ys, where xs and ys can be a single tensor or a tuple of tensors.
+
+  Args:
+    fn: A python function to be rematerialized in the backprop pass.
+    *xs: A single tensor or a list/tuple of tensors. 'xs' are input args to the
+         fn function.
+  Returns:
+    fn(*xs)
+  """
+
+  def Backward(op, *dy):
+    """The backward function that rematerializes forward outputs."""
+    always_true = tf.random.uniform([]) < 2.0
+    # Alternatively, can do this:
+    # tf.where(tf.is_nan(x),
+    #          tf.constant(float('nan'), dtype=x.dtype) * tf.ones_like(x),
+    #          x)
+    xs = [
+        tf.where(always_true, x, tf.zeros(GetShape(x), dtype=x.dtype))
+        for x in op.inputs
+    ]
+    ys = fn(*xs)
+    dxs = tf.gradients(ys, xs, grad_ys=dy)
+    dxs_final = []
+    for dx, x in zip(dxs, xs):
+      if dx is None:
+        dxs_final.append(tf.zeros_like(x))
+      else:
+        dxs_final.append(dx)
+    assert len(dxs_final) == len(xs)
+    return tuple(dxs_final)
+
+  xs_dtypes = [x.dtype for x in xs]
+
+  @function.Defun(*xs_dtypes, python_grad_func=Backward)
+  def Forward(*xs):
+    """Forward function plus sanity checks."""
+    ys = fn(*xs)
+    # Some sanity check.
+    assert not function.get_extra_inputs()
+    assert not function.get_extra_args()
+    assert not function.get_extra_vars()
+    if isinstance(ys, tuple):
+      for y in ys:
+        assert isinstance(y, tf.Tensor)
+    else:
+      assert isinstance(ys, tf.Tensor)
+
+    return ys
+
+  return Forward(*xs)

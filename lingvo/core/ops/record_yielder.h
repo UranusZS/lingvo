@@ -48,8 +48,25 @@ class RecordIterator {
   typedef std::function<RecordIterator*(const string&)> FactoryMethod;
   static bool Register(const string& type_name, FactoryMethod method);
 
+  // As above, but also register a custom method for parsing file_pattern
+  // strings into lists of shards.
+  typedef std::function<Status(const string&, std::vector<std::string>*)>
+      PatternParserMethod;
+  static bool RegisterWithPatternParser(const string& type_name,
+                                        FactoryMethod method,
+                                        PatternParserMethod parser_method);
+
   // Returns a record iterator for 'filename' of 'type_name'.
   static RecordIterator* New(const string& type_name, const string& filename);
+
+  // Returns the prefix in a file pattern, or an empty string if not exist.
+  // Example: "tfrecord:data_dir/data.tfrecord" => "tfrecord"
+  static string GetFilePatternPrefix(const string& file_pattern);
+
+  // Parse a file pattern into a list of matching files.
+  static Status ParsePattern(const string& type_name,
+                             const string& file_pattern_list,
+                             std::vector<string>* filenames);
 };
 
 // RecordYielder defines an interface that should be used for producing value
@@ -78,8 +95,14 @@ class RecordYielder {
  public:
   virtual ~RecordYielder();
 
-  // Yields one 'value'.
-  virtual Status Yield(Rope* value) = 0;
+  // Yields one 'value' and the id of the source.
+  // source_id is useful to specify the source when reading from multiple input
+  // sources. To read from multiple input sources and keep track of the
+  // source id, create a WeightedRecordYielder and create a BasicRecordYielder
+  // for each source. Each BasicRecordYielder can be assigned a source_id,
+  // which is assigned to the argument here.
+  // A nullptr can be provided as input for source_id.
+  virtual Status Yield(Rope* value, int* source_id) = 0;
 
   // Stop this yielder and then delete it.
   virtual void Close() = 0;
@@ -113,6 +136,9 @@ class BasicRecordYielder : public RecordYielder {
 
     // Uses this many concurrent iterators to iterate through files.
     int32 parallelism = 1;
+
+    // Source id to be supplied with yield.
+    int32 source_id = 0;
   };
 
   // Returns a record yielder according to 'opts'. A caller is responsible for
@@ -120,8 +146,8 @@ class BasicRecordYielder : public RecordYielder {
   // delete the yielder.
   static BasicRecordYielder* New(Options opts);
 
-  // Yields one 'value'.
-  Status Yield(Rope* value) override;
+  // Yields one 'value' and 'source_id' from which the value was read.
+  Status Yield(Rope* value, int* source_id) override;
 
   // Stop this yielder and then delete it.
   void Close() override;
@@ -143,7 +169,6 @@ class BasicRecordYielder : public RecordYielder {
     Status status;                  // Shard status.
   };
   void ShardLoop(Shard* shard);
-  Status MatchFiles(const string& patterns, std::vector<string>* filenames);
 
   // Returns true iff 's' indicates the yielder should stop.
   bool ShouldFinish(const Status& s);

@@ -21,13 +21,110 @@ from __future__ import print_function
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
-from tensorflow.contrib.tpu.python.tpu import tpu_function
 from lingvo.core import base_layer
-from lingvo.core import gpipe
+from lingvo.core import layers
 from lingvo.core import layers_with_attention
 from lingvo.core import py_utils
 from lingvo.core.gpipe import FeatureExtractionLayer
 from lingvo.core.gpipe import PipeliningLayer
+
+
+def _common_gpipe_transformer_params(p):
+  """Add GPipe params to layer."""
+  p.Define(
+      'is_transparent', False,
+      'If set, encoder outputs a list of layer outputs while decoder '
+      'expects a list of source input vectors.')
+  p.Define(
+      'num_transparent_outputs', 0,
+      'Number of transparent outputs. Only positive if this is the '
+      'last encoder')
+  p.Define('transparent_merger_tpl', None,
+           'Merger op for layer outputs. Not none if this is the last encoder')
+  return p
+
+
+def _common_gpipe_transformer_init(layer):
+  """Initialize a GPipe layer."""
+  p = layer.params
+  if p.is_transparent and p.num_transparent_outputs > 0:
+    transparent_params = []
+    for i in range(p.num_transparent_outputs):
+      transparent_param = p.transparent_merger_tpl.Copy()
+      transparent_param.name = 'transparent_%d' % i
+      transparent_params.append(transparent_param)
+    layer.CreateChildren('transparent_merger', transparent_params)
+  assert p.name
+
+
+def _common_gpipe_transformer_encoder_fprop(
+    layer, layer_class, theta, source_vecs, source_paddings, target_vecs,
+    target_paddings, source_segment_id, target_segment_id, *more_source_vecs):
+  """GPipe encoder FProp."""
+  p = layer.params
+  h, _ = super(layer_class, layer).FProp(
+      theta, source_vecs, source_paddings, source_segment_id=source_segment_id)
+  h.set_shape(source_vecs.shape)
+  if p.is_transparent:
+    more_source_vecs += (source_vecs,)
+    if p.num_transparent_outputs > 0:  # Merger layer.
+      transformer_output = []
+      for i in range(p.num_transparent_outputs):
+        merged_outputs = layer.transparent_merger[i].FProp(
+            theta.transparent_merger[i], list(more_source_vecs + (h,)))
+        transformer_output.append(merged_outputs)
+      h = transformer_output[0]
+      if p.num_transparent_outputs == 1:
+        more_source_vecs = ()
+      else:
+        more_source_vecs = tuple(transformer_output[1:])
+  return (h, source_paddings, target_vecs, target_paddings, source_segment_id,
+          target_segment_id) + more_source_vecs
+
+
+def _common_gpipe_transformer_decoder_fprop(
+    layer, layer_class, params, theta, source_vecs, source_paddings,
+    target_vecs, target_paddings, source_segment_id, target_segment_id,
+    *more_source_vecs):
+  """GPipe decoder FProp."""
+  assert target_vecs is not None
+  assert target_paddings is not None
+  h, _ = super(layer_class, layer).FProp(
+      theta,
+      target_vecs,
+      target_paddings,
+      aux_vecs=source_vecs,
+      aux_paddings=source_paddings,
+      source_segment_id=target_segment_id,
+      aux_segment_id=source_segment_id)
+  h.set_shape(target_vecs.shape)
+  if params.is_transparent and more_source_vecs:
+    source_vecs = more_source_vecs[0]
+    more_source_vecs = more_source_vecs[1:]
+  return (source_vecs, source_paddings, h, target_paddings, source_segment_id,
+          target_segment_id) + more_source_vecs
+
+
+def _common_gpipe_transformer_fprop_meta(p, inputs, *args):
+  """GPipe FPropMeta function."""
+  # TODO(huangyp): return accurate estimate of flops.
+  py_utils.CheckShapes((inputs,))
+  flops_per_element = 5
+  src_time, source_batch, dim = inputs.as_list()
+  flops = flops_per_element * src_time * src_time * source_batch * dim
+  args = args if isinstance(args, tuple) else (args,)
+  if p.is_transparent:
+    if p.has_aux_atten:  # Decoder FPropMeta
+      args = args[:-1] if len(args) > 5 else args
+    else:
+      if p.num_transparent_outputs == 0:
+        args += (inputs,)
+      elif p.num_transparent_outputs == 1:
+        # Switch back to non-transparent mode for decoder.
+        args = args[:5]
+      else:
+        args += (inputs,) * (p.num_transparent_outputs - len(args) + 4)
+  return py_utils.NestedMap(flops=flops, out_shapes=(inputs,) + args)
 
 
 class GPipeTransformerLayer(layers_with_attention.TransformerLayer):
@@ -37,31 +134,12 @@ class GPipeTransformerLayer(layers_with_attention.TransformerLayer):
   def Params(cls):
     """Configs for TransformerStack."""
     p = super(GPipeTransformerLayer, cls).Params()
-    p.Define(
-        'is_transparent', False,
-        'If set, encoder outputs a list of layer outputs while decoder '
-        'expects a list of source input vectors.')
-    p.Define(
-        'num_transparent_outputs', 0,
-        'Number of transparent outputs. Only positive if this is the '
-        'last encoder')
-    p.Define(
-        'transparent_merger_tpl', None,
-        'Merger op for layer outputs. Not none if this is the last encoder')
-    return p
+    return _common_gpipe_transformer_params(p)
 
   @base_layer.initializer
   def __init__(self, params):
     super(GPipeTransformerLayer, self).__init__(params)
-    p = self.params
-    if p.is_transparent and p.num_transparent_outputs > 0:
-      transparent_params = []
-      for i in range(p.num_transparent_outputs):
-        transparent_param = p.transparent_merger_tpl.Copy()
-        transparent_param.name = 'transparent_%d' % i
-        transparent_params.append(transparent_param)
-      self.CreateChildren('transparent_merger', transparent_params)
-    assert p.name
+    _common_gpipe_transformer_init(self)
 
   def FProp(self, theta, source_vecs, source_paddings, target_vecs,
             target_paddings, source_segment_id, target_segment_id,
@@ -69,65 +147,215 @@ class GPipeTransformerLayer(layers_with_attention.TransformerLayer):
     p = self.params
     with tf.name_scope(p.name):
       if p.has_aux_atten:  # Decoder FProp
-        assert target_vecs is not None
-        assert target_paddings is not None
-        h, _ = super(GPipeTransformerLayer, self).FProp(
-            theta,
-            target_vecs,
-            target_paddings,
-            aux_vecs=source_vecs,
-            aux_paddings=source_paddings,
-            source_segment_id=target_segment_id,
-            aux_segment_id=source_segment_id)
-        h.set_shape(target_vecs.shape)
-        if p.is_transparent and more_source_vecs:
-          source_vecs = more_source_vecs[0]
-          more_source_vecs = more_source_vecs[1:]
-        return (source_vecs, source_paddings, h, target_paddings,
-                source_segment_id, target_segment_id) + more_source_vecs
+        return _common_gpipe_transformer_decoder_fprop(
+            self, GPipeTransformerLayer, p, theta, source_vecs, source_paddings,
+            target_vecs, target_paddings, source_segment_id, target_segment_id,
+            *more_source_vecs)
       else:  # Encoder FProp
-        h, _ = super(GPipeTransformerLayer, self).FProp(
-            theta,
-            source_vecs,
-            source_paddings,
-            source_segment_id=source_segment_id)
-        h.set_shape(source_vecs.shape)
-        if p.is_transparent:
-          more_source_vecs += (source_vecs,)
-          if p.num_transparent_outputs > 0:  # Merger layer.
-            transformer_output = []
-            for i in range(p.num_transparent_outputs):
-              merged_outputs = self.transparent_merger[i].FProp(
-                  theta.transparent_merger[i], list(more_source_vecs + (h,)))
-              transformer_output.append(merged_outputs)
-            h = transformer_output[0]
-            if p.num_transparent_outputs == 1:
-              more_source_vecs = ()
-            else:
-              more_source_vecs = tuple(transformer_output[1:])
-        return (h, source_paddings, target_vecs, target_paddings,
-                source_segment_id, target_segment_id) + more_source_vecs
+        return _common_gpipe_transformer_encoder_fprop(
+            self, GPipeTransformerLayer, theta, source_vecs, source_paddings,
+            target_vecs, target_paddings, source_segment_id, target_segment_id,
+            *more_source_vecs)
 
   @classmethod
   def FPropMeta(cls, p, inputs, *args):
-    # TODO(huangyp): return accurate estimate of flops.
+    return _common_gpipe_transformer_fprop_meta(p, inputs, *args)
+
+
+class GPipeEvolvedTransformerEncoderLayer(
+    layers_with_attention.EvolvedTransformerEncoderLayer):
+  """GPipe-compatible Evolved Transformer encoder layer."""
+
+  @classmethod
+  def Params(cls):
+    p = super(GPipeEvolvedTransformerEncoderLayer, cls).Params()
+    return _common_gpipe_transformer_params(p)
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(GPipeEvolvedTransformerEncoderLayer, self).__init__(params)
+    _common_gpipe_transformer_init(self)
+
+  def FProp(self, theta, source_vecs, source_paddings, source_segment_id,
+            *more_source_vecs):
+    with tf.name_scope(self.params.name):
+      return _common_gpipe_transformer_encoder_fprop(
+          self, GPipeEvolvedTransformerEncoderLayer, theta, source_vecs,
+          source_paddings, None, None, source_segment_id, None,
+          *more_source_vecs)
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, *args):
+    return _common_gpipe_transformer_fprop_meta(p, inputs, *args)
+
+
+class GPipeEvolvedTransformerDecoderLayer(
+    layers_with_attention.EvolvedTransformerDecoderLayer):
+  """GPipe-compatible Evolved Transformer decoder layer."""
+
+  @classmethod
+  def Params(cls):
+    p = super(GPipeEvolvedTransformerDecoderLayer, cls).Params()
+    return _common_gpipe_transformer_params(p)
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(GPipeEvolvedTransformerDecoderLayer, self).__init__(params)
+    _common_gpipe_transformer_init(self)
+
+  def FProp(self, theta, source_vecs, source_paddings, target_vecs,
+            target_paddings, source_segment_id, target_segment_id,
+            *more_source_vecs):
+    with tf.name_scope(self.params.name):
+      return _common_gpipe_transformer_decoder_fprop(
+          self, GPipeEvolvedTransformerDecoderLayer, self.params, theta,
+          source_vecs, source_paddings, target_vecs, target_paddings,
+          source_segment_id, target_segment_id, *more_source_vecs)
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, *args):
+    return _common_gpipe_transformer_fprop_meta(p, inputs, *args)
+
+
+class GPipeTransformerEmbeddingLayer(base_layer.BaseLayer):
+  """GPipe compatible embeddings for transformers."""
+
+  @classmethod
+  def Params(cls):
+    """Configs of Embedding layers for TransformerStack."""
+    p = super(GPipeTransformerEmbeddingLayer, cls).Params()
+    # Note: we use the same configs for src and tgt embeddings right now.
+    p.Define('token_emb', layers.SimpleEmbeddingLayer.Params(),
+             'The embedding layer params.')
+    p.Define('position_emb', layers.PositionalEmbeddingLayer.Params(),
+             'Position embedding layer params.')
+    p.Define('input_dropout_prob', 0.0, 'Prob at which we do input dropout.')
+    p.Define(
+        'dropout_tpl', layers.DropoutLayer.Params(),
+        'Replace with deterministic dropout for splits > 1 '
+        'or microbatches > 1.')
+    p.Define('add_tgt_embedding_layer', False,
+             'Set True if layer embeds tgt instead of src.')
+    p.Define('packed_input', False, 'Set True to support packed inputs.')
+    p.Define(
+        'is_transparent', False,
+        'If set, encoder outputs a list of layer outputs while decoder '
+        'expects a list of source input vectors.')
+    p.Define('max_seq_len', 300, 'Max. seq len for decoding.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(GPipeTransformerEmbeddingLayer, self).__init__(params)
+    p = self.params
+    with tf.variable_scope(p.name):
+      p.token_emb.name = 'src_token_emb'
+      p.position_emb.name = 'src_position_emb'
+      self.CreateChild('src_token_emb', p.token_emb)
+      self.CreateChild('src_pos_emb', p.position_emb)
+
+      p.dropout_tpl.keep_prob = (1.0 - p.input_dropout_prob)
+      p.dropout_tpl.name = 'src_dropout'
+      self.CreateChild('src_dropout', p.dropout_tpl)
+
+      if p.add_tgt_embedding_layer:
+        params = p.token_emb.Copy()
+        params.name = 'tgt_token_emb'
+        self.CreateChild('tgt_token_emb', params)
+        params = p.position_emb.Copy()
+        params.name = 'tgt_position_emb'
+        self.CreateChild('tgt_pos_emb', params)
+
+        params = p.dropout_tpl.Copy()
+        params.keep_prob = (1.0 - p.input_dropout_prob)
+        params.name = 'tgt_dropout'
+        self.CreateChild('tgt_dropout', params)
+    assert p.name
+
+  def GetEmbeddings(self, emb_theta, emb, pos_emb_theta, pos_emb, dropout_theta,
+                    dropout, input_ids, input_pos_ids):
+    p = self.params
+    seq_len = tf.shape(input_ids)[0]
+    # [seq_len, batch, model_dim]
+    input_embs = emb.EmbLookup(emb_theta, input_ids)
+    if p.packed_input:  # Packed inputs.
+      # [seq_len, batch, dim] or [batch, dim] in case of beam search.
+      pos_embs = pos_emb.FPropWithPosition(pos_emb_theta, input_pos_ids)
+    else:
+      # [seq_len, 1, model_dim]
+      pos_embs = tf.expand_dims(pos_emb.FProp(pos_emb_theta, seq_len), 1)
+
+    input_embs += pos_embs
+    input_embs = dropout.FProp(dropout_theta, input_embs)
+    return input_embs
+
+  # To be used for decoding.
+  def GetEncoderEmbeddingsDefaultTheta(self, input_ids):
+    seq_len = tf.shape(input_ids)[0]
+    # [seq_len, batch, model_dim]
+    input_embs = self.src_token_emb.EmbLookup(self.theta.src_token_emb,
+                                              input_ids)
+    # [seq_len, 1, model_dim]
+    pos_embs = tf.expand_dims(
+        self.src_pos_emb.FProp(self.theta.src_pos_emb, seq_len), 1)
+    input_embs += pos_embs
+    input_embs = self.src_dropout.FProp(self.theta.src_dropout, input_embs)
+    return input_embs
+
+  # To be used for decoding.
+  def GetDecoderEmbeddingsDefaultTheta(self, input_ids, t=None):
+    p = self.params
+    seq_len = tf.shape(input_ids)[0]
+    # [seq_len, batch, model_dim]
+    input_embs = self.tgt_token_emb.EmbLookup(self.theta.tgt_token_emb,
+                                              input_ids)
+    # [seq_len, 1, model_dim]
+    if t is None:
+      pos_embs = tf.expand_dims(
+          self.tgt_pos_emb.FProp(self.theta.tgt_pos_emb, seq_len), 1)
+    else:  # Support decoding.
+      pos_embs = tf.slice(
+          self.tgt_pos_emb.FProp(self.theta.tgt_pos_emb, p.max_seq_len), [t, 0],
+          [1, p.token_emb.embedding_dim])
+    input_embs += pos_embs
+    input_embs = self.tgt_dropout.FProp(self.theta.tgt_dropout, input_embs)
+    return input_embs
+
+  def FProp(self, theta, source_id, source_paddings, target_id, target_paddings,
+            source_segment_id, target_segment_id, source_pos_id, target_pos_id):
+    p = self.params
+    with tf.name_scope(p.name):
+      source_vecs = self.GetEmbeddings(theta.src_token_emb, self.src_token_emb,
+                                       theta.src_pos_emb, self.src_pos_emb,
+                                       theta.src_dropout, self.src_dropout,
+                                       source_id, source_pos_id)
+      target_vecs = None
+      if p.add_tgt_embedding_layer:
+        target_vecs = self.GetEmbeddings(theta.tgt_token_emb,
+                                         self.tgt_token_emb, theta.tgt_pos_emb,
+                                         self.tgt_pos_emb, theta.tgt_dropout,
+                                         self.tgt_dropout, target_id,
+                                         target_pos_id)
+      return (source_vecs, source_paddings, target_vecs, target_paddings,
+              source_segment_id, target_segment_id)
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, *args):
+    # TODO(ankurbpn): return accurate estimate of flops.
     py_utils.CheckShapes((inputs,))
-    flops_per_element = 5
-    src_time, source_batch, dim = inputs.as_list()
-    flops = flops_per_element * src_time * src_time * source_batch * dim
+    flops_per_element = 2  # Is this correct?
+    vocab = p.token_emb.vocab_size
+    dim = p.token_emb.embedding_dim
+    src_time, source_batch = inputs.as_list()
+    flops = flops_per_element * src_time * source_batch * dim * vocab
     args = args if isinstance(args, tuple) else (args,)
-    if p.is_transparent:
-      if p.has_aux_atten:  # Decoder FPropMeta
-        args = args[:-1] if len(args) > 5 else args
-      else:
-        if p.num_transparent_outputs == 0:
-          args += (inputs,)
-        elif p.num_transparent_outputs == 1:
-          # Switch back to non-transparent mode for decoder.
-          args = args[:5]
-        else:
-          args += (inputs,) * (p.num_transparent_outputs - len(args) + 4)
-    return py_utils.NestedMap(flops=flops, out_shapes=(inputs,) + args)
+    new_inputs = tf.TensorShape([src_time, source_batch, dim])
+    new_args = list(args)
+    if p.add_tgt_embedding_layer:
+      tgt_time, tgt_batch = args[1].as_list()
+      new_args[1] = tf.TensorShape([tgt_time, tgt_batch, dim])
+    new_args = tuple(new_args[:5])
+    return py_utils.NestedMap(flops=flops, out_shapes=(new_inputs,) + new_args)
 
 
 class GPipeTransformerStack(PipeliningLayer):
@@ -155,6 +383,13 @@ class GPipeTransformerStack(PipeliningLayer):
     p.Define('model_dim', 1024, 'Characteristic depth (dimension).')
     p.Define('num_encoder_layers', 0, 'Number of transformer encoder layers.')
     p.Define('num_decoder_layers', 0, 'Number of transformer encoder layers.')
+    p.Define(
+        'use_pipelined_embeddings', False,
+        'Set to True if using GPipeEmbeddingLayer within the '
+        'GPipeTransformerStack. In this case all FProp inputs should be '
+        'source_id / target_id instead of source_vecs / target_vecs.')
+    p.Define('emb_tpl', GPipeTransformerEmbeddingLayer.Params(),
+             'Prepare embeddings for Transformer input.')
     p.Define('encoder_tpl', GPipeTransformerLayer.Params(),
              'TransformerLayer Encoder params tpl.')
     p.Define('decoder_tpl', GPipeTransformerLayer.Params(),
@@ -171,6 +406,8 @@ class GPipeTransformerStack(PipeliningLayer):
         'Defaults to number of decoder layers if transparent.')
     p.Define('packed_input', False,
              'If True, assumes multiple training samples per input.')
+    p.Define('apply_dropout_every_n', 1,
+             'Apply dropout to every n-th layer only.')
     p.encoder_tpl.has_aux_atten = False
     p.decoder_tpl.has_aux_atten = True
     p.decoder_tpl.mask_self_atten = True
@@ -188,17 +425,35 @@ class GPipeTransformerStack(PipeliningLayer):
         assert i < j, 'Splits must be in increasing order.'
     else:
       num_splits = max(p.splits, p.num_splits)  # Supporting deprecated param.
-      layers_per_split = num_layers // num_splits
+      layers_per_split = (num_layers - 1) // num_splits + 1
       p.splits = []
       for i in range(num_splits):
         p.splits.append((i + 1) * layers_per_split)
+      p.splits[-1] = num_layers
 
     with tf.variable_scope(p.name):
       p.encoder_tpl.source_dim = p.model_dim
       p.decoder_tpl.source_dim = p.model_dim
       transformers = []
+
+      # Encoder Embedding layer.
+      if p.use_pipelined_embeddings:
+        if len(p.splits) > 1 or p.num_micro_batches > 1:
+          p.emb_tpl.dropout_tpl = layers.DeterministicDropoutLayer.Params()
+        p.emb_tpl.packed_input = p.packed_input
+        p.emb_tpl.is_transparent = p.is_transparent
+        p.emb_tpl.add_tgt_embedding_layer = (p.num_decoder_layers > 0)
+        p.emb_tpl.name = 'emb'
+        transformers.append(p.emb_tpl)
+
+      # Encoder layers.
       for i in range(p.num_encoder_layers):
         params = p.encoder_tpl.Copy()
+        if i % p.apply_dropout_every_n != 0:
+          params.tr_atten_tpl.residual_dropout_prob = 0.0
+          params.tr_atten_tpl.atten_dropout_prob = 0.0
+          params.tr_fflayer_tpl.residual_dropout_prob = 0.0
+          params.tr_fflayer_tpl.relu_dropout_prob = 0.0
         params.name = 'encoder_%d' % (i)
         params.is_transparent = p.is_transparent
         params.packed_input = p.packed_input
@@ -215,6 +470,8 @@ class GPipeTransformerStack(PipeliningLayer):
           params.transparent_merger_tpl = transparent_merger_tpl
           params.num_transparent_outputs = p.num_transparent_outputs
         transformers.append(params)
+
+      # Decoder layers.
       for i in range(p.num_decoder_layers):
         params = p.decoder_tpl.Copy()
         params.name = 'decoder_%d' % (i)
@@ -222,32 +479,42 @@ class GPipeTransformerStack(PipeliningLayer):
         params.packed_input = p.packed_input
         params.is_transparent = p.is_transparent and (
             p.num_transparent_outputs == p.num_decoder_layers)
+        if i % p.apply_dropout_every_n != 0:
+          params.tr_atten_tpl.residual_dropout_prob = 0.0
+          params.tr_atten_tpl.atten_dropout_prob = 0.0
+          params.tr_fflayer_tpl.residual_dropout_prob = 0.0
+          params.tr_fflayer_tpl.relu_dropout_prob = 0.0
         if len(p.splits) > 1 or p.num_micro_batches > 1:
           params = self.SetupDeterministicDropout(params)
         assert params.has_aux_atten
         transformers.append(params)
       cells = []
       cell_start = 0
+      # To account for embedding layers in the pipeline.
+      offset = 0
+      if p.use_pipelined_embeddings:
+        offset += 1
       for split, cell_end in enumerate(p.splits):
-        sub = transformers[cell_start:cell_end]
+        # Layer 0 (embeddings) is always in split 0.
+        sub = transformers[cell_start:(cell_end + offset)]
         cell = FeatureExtractionLayer.Params().Set(
             name='cell_{}'.format(split), sub=sub)
         cells.append(cell)
-        cell_start = cell_end
+        cell_start = cell_end + offset
       p.cell_tpl = cells
     super(GPipeTransformerStack, self).__init__(p)
 
   def SetupDeterministicDropout(self, params):
     """Replaced dropout layers in transformer with deterministic ones."""
     params.tr_atten_tpl.residual_dropout_tpl = (
-        DeterministicDropoutLayer.Params())
+        layers.DeterministicDropoutLayer.Params())
     params.tr_atten_tpl.atten_tpl.atten_dropout_deterministic = True
     params.tr_atten_tpl.atten_tpl.inner_atten_params \
     .atten_dropout_deterministic = True
     params.tr_fflayer_tpl.residual_dropout_tpl = (
-        DeterministicDropoutLayer.Params())
+        layers.DeterministicDropoutLayer.Params())
     params.tr_fflayer_tpl.fflayer_tpl.dropout = (
-        DeterministicDropoutLayer.Params())
+        layers.DeterministicDropoutLayer.Params())
     return params
 
   def GetEncoders(self):
@@ -280,6 +547,14 @@ class GPipeTransformerStack(PipeliningLayer):
     assert len(decoders) == p.num_decoder_layers
     return decoders
 
+  def EncoderEmbedFPropDefaultTheta(self, source_id):
+    emb = self.children['cell_0'].children['emb']
+    return emb.GetEncoderEmbeddingsDefaultTheta(source_id)
+
+  def DecoderEmbedFPropDefaultTheta(self, tgt_id, t=None):
+    emb = self.children['cell_0'].children['emb']
+    return emb.GetDecoderEmbeddingsDefaultTheta(tgt_id, t)
+
   def EncoderFPropDefaultTheta(self,
                                source_vecs,
                                source_paddings,
@@ -303,25 +578,35 @@ class GPipeTransformerStack(PipeliningLayer):
 
   def FProp(self,
             theta,
-            source_vecs,
+            source_input,
             source_paddings,
-            target_vecs=None,
+            target_input=None,
             target_paddings=None,
             source_segment_id=None,
-            target_segment_id=None):
+            target_segment_id=None,
+            source_pos_id=None,
+            target_pos_id=None):
     """Transforms source sequence of Tensors with Transformers layers.
 
     Args:
       theta: A `.NestedMap` object containing weights' values of this layer and
         its children layers.
-      source_vecs: A sequence of input Tensors of [time, batch, dim] shape.
+      source_input: A sequence of input Tensors of [time, batch, dim] shape.
+        If p.use_pipelined_embeddings is set, A sequence of ints indicating
+        source input ids of [time, batch] shape.
       source_paddings: A sequence of 0s and 1s indicating input paddings of
         [time, batch] shape.
-      target_vecs: [target_time, target_batch, dim]
+      target_input: [target_time, target_batch, dim]. If
+        p.use_pipelined_embeddings is set, A sequence of ints indicating target
+        input ids of [time, batch] shape.
       target_paddings: [target_time, target_batch]
       source_segment_id: A sequence of ints indicating source segment ids of
         [time, batch] shape.
       target_segment_id: A sequence of ints indicating target segment ids of
+        [time, batch] shape.
+      source_pos_id: A sequence of ints indicating source position ids of
+        [time, batch] shape.
+      target_pos_id: A sequence of ints indicating target position ids of
         [time, batch] shape.
 
     Returns:
@@ -329,14 +614,25 @@ class GPipeTransformerStack(PipeliningLayer):
     """
     p = self.params
     if p.num_decoder_layers > 0:
-      assert target_vecs is not None
+      assert target_input is not None
       assert target_paddings is not None
     if p.packed_input:
       assert source_segment_id is not None, (
           'Need to specify src_segment_id if packed input is supported.')
-    gpipe_outputs = super(GPipeTransformerStack, self).FProp(
-        theta, source_vecs, source_paddings, target_vecs, target_paddings,
-        source_segment_id, target_segment_id)
+      if p.use_pipelined_embeddings:
+        assert source_pos_id is not None, (
+            'Need to specify src_pos_id for packed input and embeddings.')
+    if p.use_pipelined_embeddings:
+      gpipe_outputs = super(GPipeTransformerStack,
+                            self).FProp(theta, source_input, source_paddings,
+                                        target_input, target_paddings,
+                                        source_segment_id, target_segment_id,
+                                        source_pos_id, target_pos_id)
+    else:
+      gpipe_outputs = super(GPipeTransformerStack,
+                            self).FProp(theta, source_input, source_paddings,
+                                        target_input, target_paddings,
+                                        source_segment_id, target_segment_id)
     if p.num_decoder_layers > 0:
       transformer_output = gpipe_outputs[2]
     else:
@@ -344,377 +640,8 @@ class GPipeTransformerStack(PipeliningLayer):
       more_source_vecs = gpipe_outputs[6:]
       if more_source_vecs:
         transformer_output = more_source_vecs + (gpipe_outputs[0],)
+    tf.logging.info(transformer_output)
     return transformer_output
-
-
-class AddingAccumulator(base_layer.Accumulator):
-  """Accumulator for the sufficient statistics."""
-
-  def __init__(self, shape, dtype):
-    super(AddingAccumulator, self).__init__()
-    self.dtype = dtype
-    self.shape = shape
-
-  def DefaultValue(self):
-    return tf.zeros(self.shape, dtype=self.dtype)
-
-  def Update(self, value):
-    self.SetValue(self.GetValue() + tf.cast(value, self.dtype))
-
-
-class BatchNormLayerNoPadding(base_layer.BaseLayer):
-  """Batchnorm layer without padding."""
-
-  @classmethod
-  def Params(cls):
-    p = super(BatchNormLayerNoPadding, cls).Params()
-    p.Define('dim', 0, 'Depth of the input/output.')
-    p.Define(
-        'decay', 0.997,
-        'Decay in updating the mean and variance moving average used in'
-        ' batch normalization.')
-    p.Define('epsilon', 0.001,
-             'Small float added to variance to avoid dividing by zero.')
-    p.Define(
-        'bn_group_size', 1,
-        'The number of shards participating in normalization when distributed'
-        ' batchnorm is used. Only used for TPU.')
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(BatchNormLayerNoPadding, self).__init__(params)
-    p = self.params
-    assert p.name
-    assert p.dim > 0
-    p.fprop_dtype = None
-    self.RegisterAccumulator('counts', AddingAccumulator([], p.dtype))
-    self.RegisterAccumulator('mean_ss', AddingAccumulator([p.dim], p.dtype))
-    self.RegisterAccumulator('variance_ss', AddingAccumulator([p.dim], p.dtype))
-    collections = [
-        self.__class__.__name__ + '_vars', py_utils.SKIP_LP_REGULARIZATION
-    ]
-    pc = py_utils.WeightParams(
-        shape=[p.dim],
-        init=py_utils.WeightInit.Constant(0.0),
-        dtype=p.dtype,
-        collections=collections)
-
-    with tf.variable_scope(p.name):
-      self.CreateVariable('beta', pc)
-      # Note, The real gamma to use is 1 + gamma.
-      self.CreateVariable('gamma', pc, lambda x: 1.0 + x)
-
-      moving_collections = [
-          'moving_vars', tf.GraphKeys.MOVING_AVERAGE_VARIABLES,
-          self.__class__.__name__ + '_vars'
-      ]
-      mva = py_utils.WeightParams(
-          shape=[p.dim],
-          init=py_utils.WeightInit.Constant(0.0),
-          dtype=p.dtype,
-          collections=moving_collections)
-      # Two statistics.
-      self.CreateVariable('moving_mean', mva, trainable=False)
-      mvv = py_utils.WeightParams(
-          shape=[p.dim],
-          init=py_utils.WeightInit.Constant(1.0),
-          dtype=p.dtype,
-          collections=moving_collections)
-      self.CreateVariable('moving_variance', mvv, trainable=False)
-
-  def PostTrainingStepUpdate(self, global_step):
-    p = self.params
-    counts = self.accumulators.counts.GetValue()
-    mean_ss = self.accumulators.mean_ss.GetValue()
-    variance_ss = self.accumulators.variance_ss.GetValue()
-    mean, variance = tf.nn.normalize_moments(counts, mean_ss, variance_ss, None)
-    decay = tf.convert_to_tensor(1.0 - p.decay, p.dtype)
-    with tf.name_scope(p.name) as scope:
-      with tf.colocate_with(self.vars.moving_mean):
-        mean_update = tf.assign_sub(
-            self.vars.moving_mean,
-            (self.vars.moving_mean - tf.cast(mean, p.dtype)) * decay,
-            name='moving_mean_update')
-      with tf.colocate_with(self.vars.moving_variance):
-        var_update = tf.assign_sub(
-            self.vars.moving_variance,
-            (self.vars.moving_variance - tf.cast(variance, p.dtype)) * decay,
-            name='moving_variance_update')
-      py_utils.CheckNumerics(
-          self.vars.moving_mean,
-          'moving mean of {} failed numeric check'.format(scope))
-      py_utils.CheckNumerics(
-          self.vars.moving_variance,
-          'moving variance of {} failed numeric check'.format(scope))
-    self.accumulators.counts.Reset()
-    self.accumulators.mean_ss.Reset()
-    self.accumulators.variance_ss.Reset()
-    return tf.group(mean_update, var_update)
-
-  def _Moments(self, inputs, group_size):
-    """Computes mean and variance over N,H,W dimensions in inputs."""
-    counts, mean_ss, variance_ss, _, = tf.nn.sufficient_statistics(
-        inputs, axes=[0, 1, 2], keep_dims=False)
-    self.accumulators.counts.Update(counts)
-    self.accumulators.mean_ss.Update(mean_ss)
-    self.accumulators.variance_ss.Update(variance_ss)
-    if py_utils.use_tpu() and group_size > 1:
-      num_shards = tpu_function.get_tpu_context().number_of_shards
-      assert num_shards >= group_size
-      assert num_shards % group_size == 0
-      num_groups = num_shards // group_size
-      group_assignment = []
-      for g in range(num_groups):
-        replica_ids = [g * group_size + i for i in range(group_size)]
-        group_assignment.append(replica_ids)
-      counts *= group_size
-      mean_ss = tf.contrib.tpu.cross_replica_sum(mean_ss, group_assignment)
-      variance_ss = tf.contrib.tpu.cross_replica_sum(variance_ss,
-                                                     group_assignment)
-    mean, variance = tf.nn.normalize_moments(counts, mean_ss, variance_ss, None)
-    return mean, variance
-
-  def FProp(self, theta, inputs):
-    """Apply batch normalization.
-
-    Using the implementation in github.com/
-    tensorflow/tpu/blob/master/models/official/amoeba_net/network_utils.py#L550
-
-    Args:
-      theta: A nested map object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-
-    Returns:
-      Output after applying batch normalization, with the same shape as
-      'inputs'.
-    """
-    p = self.params
-    inputs_dtype = inputs.dtype
-    inputs = tf.cast(inputs, p.dtype)
-    inputs = py_utils.with_dependencies(
-        [py_utils.assert_shape_match([tf.shape(inputs)[-1]], [p.dim])], inputs)
-    with tf.name_scope(p.name) as scope:
-      if p.is_eval:
-        outputs = tf.nn.batch_normalization(inputs, self.vars.moving_mean,
-                                            self.vars.moving_variance,
-                                            theta.beta, theta.gamma, p.epsilon)
-      else:
-        mean, variance = self._Moments(inputs, p.bn_group_size)
-        mean = py_utils.CheckNumerics(
-            mean, 'mean of {} failed numeric check'.format(scope))
-        variance = py_utils.CheckNumerics(
-            variance, 'variance of {} failed numeric check'.format(scope))
-        outputs = tf.nn.batch_normalization(inputs, mean, variance, theta.beta,
-                                            theta.gamma, p.epsilon)
-      outputs.set_shape(inputs.get_shape())
-      return tf.cast(outputs, inputs_dtype)
-
-  @classmethod
-  def FPropMeta(cls, p, inputs):
-    py_utils.CheckShapes((inputs,))
-    flops_per_element = 10  # Approximately 10 flops per element.
-    return py_utils.NestedMap(
-        flops=inputs.num_elements() * flops_per_element, out_shapes=(inputs,))
-
-
-class ParallelLayer(base_layer.BaseLayer):
-  """A layer which concats or adds a few layers in parallel."""
-
-  @classmethod
-  def Params(cls):
-    p = super(ParallelLayer, cls).Params()
-    p.Define(
-        'sub', [], 'A list of sub layers\' params. Each sub layer\'s '
-        'FProp must return one Tensor or a tuple of Tensors. '
-        'Their return values then can be merged according to the '
-        'merge method. ')
-    p.Define('reduce_fn', tf.add_n, 'tf.add_n|lambda x: tf.concat(x, -1)')
-    p.Define(
-        'reduce_meta', None, 'Callable to compute the meta of reduce_fn '
-        'It takes a list of tuples of TensorShape, and returns a '
-        'NestedMap with flops and out_shapes, etc.')
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(ParallelLayer, self).__init__(params)
-    p = self.params
-    assert p.name
-    assert len(p.sub) > 1
-    with tf.variable_scope(p.name):
-      self.CreateChildren('sub', p.sub)
-
-  def FProp(self, theta, *args):
-    """Compute the output given a list of inputs.
-
-    Args:
-      theta: weights.
-      *args: A list of inputs, providing input to eac sub layer. Requiring
-        len(args) == len(p.sub)
-
-    Returns:
-      A reduced output using p.reduce_fn
-    """
-    p = self.params
-    assert len(args) == len(self.sub)
-    # Computes sub layers in parallel.
-    outputs = []
-    for (ch, th, inputs) in zip(self.sub, theta.sub, list(args)):
-      out = ch.FProp(th, inputs)
-      if isinstance(out, (list, tuple)):
-        outputs.append(list(out))
-      else:
-        outputs.append([out])
-
-    assert all(len(x) == len(outputs[0])
-               for x in outputs), 'outputs: {}'.format(outputs)
-    rets = []
-    for lane in zip(*outputs):
-      if any(x is None for x in lane):
-        rets.append(None)
-      else:
-        rets.append(p.reduce_fn(lane))
-
-    return tuple(rets) if len(rets) > 1 else rets[0]
-
-  @classmethod
-  def FPropMeta(cls, p, *args):
-    py_utils.CheckShapes(args)
-    total = 0
-    outputs = []
-    for sub in p.sub:
-      meta = sub.cls.FPropMeta(sub, *args)
-      py_utils.CheckShapes(meta.out_shapes)
-      total += meta.flops
-      outputs.append(meta.out_shapes)
-
-    meta = p.reduce_meta(outputs)
-    py_utils.CheckShapes(meta.out_shapes)
-    meta.flops += total
-    return meta
-
-
-class ReduceMeanLayer(base_layer.BaseLayer):
-  """Construct to a layer that returns the spatial mean of the inputs."""
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(ReduceMeanLayer, self).__init__(params)
-    p = self.params
-    assert p.name
-
-  def FProp(self, theta, inputs, *args):
-    return tf.reduce_mean(inputs, [1, 2])
-
-  @classmethod
-  def FPropMeta(cls, p, inputs, *args):
-    py_utils.CheckShapes((inputs,))
-    input_shape_list = inputs.as_list()
-    out_shape = tf.TensorShape(input_shape_list[0:1] + input_shape_list[3:])
-    return py_utils.NestedMap(
-        flops=inputs.num_elements(), out_shapes=(out_shape,))
-
-
-class TupleLayer(base_layer.BaseLayer):
-  """A helper layer that returns a a duplicated tuple of the first argument."""
-
-  @classmethod
-  def Params(cls):
-    p = super(TupleLayer, cls).Params()
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(TupleLayer, self).__init__(params)
-    p = self.params
-    assert p.name
-
-  def FProp(self, theta, inputs, *args):
-    return inputs, inputs
-
-  @classmethod
-  def FPropMeta(cls, p, inputs, *args):
-    py_utils.CheckShapes((inputs,))
-    return py_utils.NestedMap(flops=0, out_shapes=(inputs, inputs))
-
-
-class DeterministicDropoutLayer(base_layer.BaseLayer):
-  """Dropout fully deterministic by scope_name and time step."""
-
-  @classmethod
-  def Params(cls):
-    p = super(DeterministicDropoutLayer, cls).Params()
-    p.Define('keep_prob', 1.0, 'Keep probability.')
-    p.Define(
-        'burn_in_steps', 0,
-        'The droppath keep probability will increase linearly with time '
-        'until drop_path_burn_in_steps')
-    p.Define(
-        'noise_shape_dim', None, 'Set noise_shape to input shape if -1 '
-        'Otherwise noise_shape[noise_shape_dim]=inputs[noise_shape_dim]')
-    p.Define('num_micro_batches', 128, 'Maximum number of micro-batches')
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(DeterministicDropoutLayer, self).__init__(params)
-    p = self.params
-    assert p.keep_prob >= 0.0
-    assert p.burn_in_steps >= 0
-    cluster_params = self.cluster.params.Copy()
-    if p.burn_in_steps > 0 and cluster_params.mode == 'sync':
-      cluster_params.job = 'trainer_client'
-      my_cluster = cluster_params.cls(cluster_params)
-      splits = my_cluster.num_splits_per_client
-      p.burn_in_steps /= splits
-
-  def FProp(self, theta, inputs):
-    """Apply dropout to inputs.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.
-
-    Returns:
-      inputs with dropout applied at training time.
-    """
-    p = self.params
-    if p.keep_prob >= 1.0 or p.is_eval:
-      return inputs
-
-    with tf.name_scope(p.name):
-      mb_tensor = gpipe.GetOverWriteGlobalStep()
-      if p.burn_in_steps > 0:
-        current_step = tf.cast(mb_tensor // p.num_micro_batches, inputs.dtype)
-        current_ratio = current_step / tf.cast(p.burn_in_steps, inputs.dtype)
-        current_ratio = tf.minimum(tf.cast(1.0, inputs.dtype), current_ratio)
-        keep_prob = (1 - current_ratio * (1 - p.keep_prob))
-      else:
-        keep_prob = tf.cast(p.keep_prob, inputs.dtype)
-
-      seeds = gpipe.GenerateStepSeedPair(p)
-      noise_shape = py_utils.GetShape(inputs)
-      if p.noise_shape_dim and p.noise_shape_dim < inputs.shape.ndims:
-        for d in range(inputs.shape.ndims):
-          if d != p.noise_shape_dim:
-            noise_shape[d] = 1
-      random_tensor = (
-          tf.cast(keep_prob, tf.float32) +
-          tf.contrib.stateless.stateless_random_uniform(
-              noise_shape, seed=seeds, dtype=tf.float32))
-      binary_tensor = tf.cast(tf.floor(random_tensor), inputs.dtype)
-      ret = tf.div(inputs, keep_prob) * binary_tensor
-      ret.set_shape(inputs.get_shape())
-      return ret
-
-  @classmethod
-  def FPropMeta(cls, p, inputs):
-    py_utils.CheckShapes((inputs,))
-    return py_utils.NestedMap(
-        flops=inputs.num_elements() * 5, out_shapes=(inputs,))
 
 
 class DeterministicWeightedSumLayer(base_layer.BaseLayer):
@@ -732,7 +659,8 @@ class DeterministicWeightedSumLayer(base_layer.BaseLayer):
         'layer on top of the weights for normalization.')
     p.Define('global_weight_scale', 1.0, 'A global scale put on weights.')
     p.Define('minimal_prob', 0.0, 'The minimal weight for each component.')
-    p.Define('dropout_tpl', DeterministicDropoutLayer.Params(), 'Dropout layer')
+    p.Define('dropout_tpl', layers.DeterministicDropoutLayer.Params(),
+             'Dropout layer')
     return p
 
   @base_layer.initializer

@@ -229,6 +229,12 @@ class StackedRNNBase(base_layer.BaseLayer):
 class StackedFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
   """An implemention of StackedRNNBase which computes layer-by-layer."""
 
+  @classmethod
+  def Params(cls):
+    p = super(StackedFRNNLayerByLayer, cls).Params()
+    p.Define('rnn_tpl', FRNN.Params(), 'Rnn cell default params.')
+    return p
+
   @base_layer.initializer
   def __init__(self, params):
     super(StackedFRNNLayerByLayer, self).__init__(params)
@@ -237,7 +243,7 @@ class StackedFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
     rnn_params = []
     with tf.name_scope(p.name):
       for (i, cell_tpl) in enumerate(self._GetCellTpls()):
-        params = FRNN.Params()
+        params = p.rnn_tpl.Copy()
         params.packed_input = p.packed_input
         params.allow_implicit_capture = p.allow_implicit_capture
         params.name = 'frnn_%d' % i
@@ -1061,9 +1067,6 @@ class FRNNWithAttention(base_layer.BaseLayer):
     s_seq_len = tf.shape(src_encs)[0]
 
     zero_atten_state = atten.ZeroAttentionState(s_seq_len, batch_size)
-    state0.step_state = py_utils.NestedMap(
-        global_step=py_utils.GetOrCreateGlobalStep(),
-        time_step=tf.constant(0, dtype=tf.int64))
     if p.use_zero_atten_state:
       zero_atten_context = tf.zeros([batch_size, p.atten_context_dim],
                                     dtype=py_utils.FPropDtype(p))
@@ -1074,12 +1077,9 @@ class FRNNWithAttention(base_layer.BaseLayer):
     else:
       state0.atten, state0.atten_probs, state0.atten_state = (
           atten.ComputeContextVectorWithSource(
-              theta.atten,
-              packed_src,
+              theta.atten, packed_src,
               tf.zeros([batch_size, p.cell.num_output_nodes],
-                       dtype=self.cell.params.dtype),
-              zero_atten_state,
-              step_state=state0.step_state))
+                       dtype=self.cell.params.dtype), zero_atten_state))
     return state0
 
   def reset_atten_state(self, theta, state, inputs):
@@ -1155,7 +1155,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
         state0_mod = self.reset_atten_state(theta, state0_mod, inputs)
       else:
         state0_mod = state0
-      state1 = py_utils.NestedMap(step_state=state0_mod.step_state)
+      state1 = py_utils.NestedMap()
       if rcell.params.inputs_arity == 1:
         act = [_ConcatLastDim(inputs.act, state0_mod.atten)]
       else:
@@ -1171,9 +1171,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
               theta.packed_src,
               rcell.GetOutput(state1.rnn),
               state0_mod.atten_state,
-              step_state=state0_mod.step_state,
               query_segment_id=tf.squeeze(inputs.segment_id, 1)))
-      state1.step_state.time_step += 1
       return state1, py_utils.NestedMap()
 
     if p.packed_input:
@@ -1183,7 +1181,10 @@ class FRNNWithAttention(base_layer.BaseLayer):
 
     acc_state, final_state = recurrent.Recurrent(
         theta=py_utils.NestedMap(
-            rnn=theta.cell, packed_src=packed_src, atten=theta.atten),
+            rnn=theta.cell,
+            packed_src=packed_src,
+            atten=theta.atten,
+            global_step=theta.global_step),
         state0=state0,
         inputs=py_utils.NestedMap(
             act=inputs,
@@ -1207,7 +1208,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
     Returns:
       A tuple (atten_context, rnn_output, atten_probs).
 
-      - atten_context: a tensor of [time, batch, attention.hidden_dim].
+      - atten_context: a tensor of [time, batch, attention.context_dim].
       - rnn_output: a tensor of [time, batch, rcell.num_output_nodes].
       - atten_probs: a tensor of [time, batch, source_seq_length].
     """
@@ -1270,7 +1271,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
     Returns:
       A tuple (atten_context, rnn_output, atten_probs, final_state).
 
-      - atten_context: a tensor of [time, batch, attention.hidden_dim].
+      - atten_context: a tensor of [time, batch, attention.context_dim].
       - rnn_output: a tensor of [time, batch, rcell.num_output_nodes].
       - atten_probs: a tensor of [time, batch, source_seq_length].
       - final_state: The final recurrent state.
@@ -1403,9 +1404,6 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
 
     ctxs0 = []
     packed_srcs = py_utils.NestedMap()
-    state0.step_state = py_utils.NestedMap(
-        global_step=py_utils.GetOrCreateGlobalStep(),
-        time_step=tf.constant(0, dtype=tf.int64))
     for i, src_name in enumerate(p.source_names):
       att_idx = (0 if p.share_attention else i)
 
@@ -1418,11 +1416,8 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
       zero_atten_state = self.attentions[att_idx].ZeroAttentionState(
           s_seq_len, batch_size)
       ctxs0.append(self.attentions[att_idx].ComputeContextVectorWithSource(
-          theta.attentions[att_idx],
-          packed_srcs[src_name],
-          query_vec0,
-          zero_atten_state,
-          step_state=state0.step_state)[0])
+          theta.attentions[att_idx], packed_srcs[src_name], query_vec0,
+          zero_atten_state)[0])
 
     # Initial attention state is the output of merger-op.
     state0.atten = self.atten_merger.FProp(theta.atten_merger, ctxs0,
@@ -1490,7 +1485,7 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
 
     def CellFn(theta, state0, inputs):
       """Computes one step forward."""
-      state1 = py_utils.NestedMap(step_state=state0.step_state)
+      state1 = py_utils.NestedMap()
       state1.rnn, _ = rcell.FProp(
           theta.rnn, state0.rnn,
           py_utils.NestedMap(
@@ -1507,10 +1502,9 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
             theta.packed_src[src_name],
             query_vec,
             state0.atten,
-            step_state=state0.step_state)[0])
+        )[0])
       state1.atten = self.atten_merger.FProp(theta.atten_merger, local_ctxs,
                                              query_vec)
-      state1.step_state.time_step += 1
       return state1, py_utils.NestedMap()
 
     # Note that, we have a NestedMap for each parameter.

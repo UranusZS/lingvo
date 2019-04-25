@@ -28,7 +28,6 @@ from tensorflow.python.framework import function
 from lingvo.core import attention
 from lingvo.core import base_decoder
 from lingvo.core import base_layer
-from lingvo.core import cluster_factory
 from lingvo.core import layers
 from lingvo.core import layers_with_attention
 from lingvo.core import model_helper
@@ -225,18 +224,43 @@ class MTBaseDecoder(base_decoder.BaseBeamSearchDecoder):
     return targets
 
   def _AddAttenProbsSummary(self, source_paddings, targets, atten_probs):
+    """Add summary of attention probs.
+
+    Args:
+      source_paddings: source padding, of shape [src_len, src_batch].
+      targets: A dict of string to tensors representing the targets one try to
+        predict. Each tensor in targets is of shape [tgt_batch, tgt_len].
+      atten_probs: a list of attention probs, each element is of shape [tgt_len,
+        tgt_batch, src_len].
+    """
+    if not self.cluster.add_summary:
+      return
+
+    self._AddAttenProbsImageSummary(source_paddings, targets, atten_probs)
+    self._AddAttenProbsHistogramSummary(atten_probs)
+
+  def _AddAttenProbsHistogramSummary(self, atten_probs):
+    """Add histogram summary of attention probs.
+
+    Args:
+      atten_probs: a list of attention probs, each element is of shape [tgt_len,
+        tgt_batch, src_len].
+    """
+    for i, probs in enumerate(atten_probs):
+      # a prefix from the context will be used, which looks like
+      # fprop/wmt14_en_de_transformer/tower_0_0/dec/
+      summary_utils.histogram('atten{}'.format(i + 1), probs)
+
+  def _AddAttenProbsImageSummary(self, source_paddings, targets, atten_probs):
     """Add image summary of attention probs.
 
     Args:
       source_paddings: source padding, of shape [src_len, src_batch].
       targets: A dict of string to tensors representing the targets one try to
-          predict. Each tensor in targets is of shape [tgt_batch, tgt_len].
-      atten_probs: a list of attention probs, each element is of shape
-          [tgt_len, tgt_batch, src_len].
+        predict. Each tensor in targets is of shape [tgt_batch, tgt_len].
+      atten_probs: a list of attention probs, each element is of shape [tgt_len,
+        tgt_batch, src_len].
     """
-    if not self.cluster.add_summary:
-      return
-
     num_rows = len(atten_probs)
     fig = plot.MatplotlibFigureSummary(
         'decoder_example',
@@ -801,6 +825,10 @@ class TransformerDecoder(MTBaseDecoder):
     p.Define(
         'is_transparent', False, 'If set, expects a tensor of shape '
         '[time, batch, source_dim, num_trans_layers] as source encodings.')
+    p.Define(
+        'add_multiheaded_attention_scalar_summary', False,
+        'If set, will include scalar summaries for multi-headed attention'
+        ' to visualize the sparsity statistics of attention weights.')
 
     # Default config for the token embedding.
     p.token_emb.vocab_size = 32000
@@ -864,6 +892,73 @@ class TransformerDecoder(MTBaseDecoder):
       p.softmax.input_dim = p.model_dim
       self.CreateChild('softmax', p.softmax)
 
+  def _ExpandToNumHyps(self, source_enc_len, num_hyps_per_beam):
+    """Repeat each value according to num hyps.
+
+    Args:
+      source_enc_len: source encoder length; int [batch].
+      num_hyps_per_beam: number of hypotheses
+
+    Returns:
+      New version of source_enc_len; int [batch * num_hyps_per_beam].
+      Target_batch is (num_hyps_per_beam * batch).
+      Example: src_enc_len = [3, 2, 1] and num_hyps_per_beam = 2
+      --> [3, 2, 1, 3, 2, 1]
+    """
+    x = tf.tile(input=source_enc_len, multiples=[num_hyps_per_beam])
+    return x
+
+  def _RemoveEOSProbs(self, p, probs, source_enc_len):
+    """Remove the attention probs on EOS symbol and renormalize.
+
+    Args:
+      p: decoder params.
+      probs: attention probs matrix; float [batch, target_len, source_len].
+      source_enc_len: source encoder length; int [batch].
+
+    Returns:
+      probs with value on last actual token (EOS token) replaced by 0 and
+      renormalized so that final dim (src_len) sums to 1 again; float
+      [batch, target_len, source_len].
+    """
+    batch = py_utils.GetShape(probs)[0]
+    source_enc_len = py_utils.HasShape(source_enc_len, [batch])
+
+    # Set -1 values
+    target_len = py_utils.GetShape(probs)[1]
+    replacements = tf.ones([py_utils.GetShape(probs)[0], target_len],
+                           dtype=py_utils.FPropDtype(p)) * (-1)
+
+    index_0 = tf.reshape(tf.range(batch), shape=[batch, 1, 1])
+    index_0 *= tf.ones(shape=[batch, target_len, 1], dtype=tf.int32)
+
+    index_1 = tf.ones(shape=[batch, 1], dtype=tf.int32)
+    index_1 *= tf.expand_dims(tf.range(target_len), 0)
+    index_1 = tf.expand_dims(index_1, -1)
+
+    index_2 = tf.reshape(source_enc_len, shape=[batch, 1, 1]) - 1  # Note the -1
+    index_2 = tf.to_int32(index_2)
+    index_2 *= tf.ones(shape=[batch, target_len, 1], dtype=tf.int32)
+
+    index = tf.concat([index_0, index_1, index_2], axis=2)
+
+    # Original update matrix contained -1 values. Change all to 1 except for
+    # those positions coming from scatter which will be 0.
+    updates = tf.scatter_nd(
+        index, updates=replacements, shape=py_utils.GetShape(probs))
+    updates += 1
+    res = probs * updates
+
+    # Normalize to that probs sum to 1.
+    # Add eps to sum to deal with case where all probs except last one are 0.
+    # In this case then, attention probs will not sum to 1 but this seems still
+    # better then evenly distributing attention probs in this case.
+    s = tf.reduce_sum(res, axis=2, keepdims=True)
+    epsilon = tf.constant(value=1e-6, dtype=py_utils.FPropDtype(p))
+    s += epsilon
+    res /= s
+    return res
+
   def _FProp(self, theta, encoder_outputs, targets):
     """Decodes `targets` given encoded source.
 
@@ -885,7 +980,10 @@ class TransformerDecoder(MTBaseDecoder):
         predict. Each tensor in targets is of shape [batch, time].
 
     Returns:
-      Output of last decoder layer, [target_time, target_batch, source_dim].
+      `.NestedMap` containing output of last decoder layer and attention probs:
+        softmax_input: Tensor of shape [time, batch, params.softmax.input_dim].
+        attention: `.NestedMap` of attention distributions of shape
+        [batch, target_length, source_length].
     """
     p = self.params
     source_encs = encoder_outputs.encoded
@@ -940,8 +1038,15 @@ class TransformerDecoder(MTBaseDecoder):
       input_embs = tf.transpose(input_embs, [1, 0, 2])
       input_embs = self.input_dropout.FProp(theta.input_dropout, input_embs)
 
-      atten_probs = []
+      if not p.packed_input:
+        src_enc_len = tf.reduce_sum(1 - source_paddings, axis=0)
+        num_hyps_per_beam = tf.div(
+            py_utils.GetShape(target_paddings)[1],
+            py_utils.GetShape(source_paddings)[1])
+        src_enc_len = self._ExpandToNumHyps(src_enc_len, num_hyps_per_beam)
+
       layer_in = input_embs
+      per_layer_attn_probs = []
       for i, (layer, layer_theta) in enumerate(zip(self.trans, theta.trans)):
         # [time, batch, model_dim]
         layer_out, probs = layer.FProp(
@@ -953,11 +1058,27 @@ class TransformerDecoder(MTBaseDecoder):
             source_segment_id=target_segment_id,
             aux_segment_id=src_segment_id)
         layer_in = layer_out
-        atten_probs.append(probs)
+        pl_probs = tf.transpose(probs, [1, 0, 2])
+        if p.packed_input:
+          # For packed inputs we are currently not removing the EOS token.
+          per_layer_attn_probs.append(pl_probs)
+        else:
+          # Remove attention weight on last (EOS) token and re-normalize
+          # so that last dimension sums to 1. See b/129097156.
+          # Original probs shape: [trg time, batch, src time]
+          norma_atten_probs_3d = self._RemoveEOSProbs(p, pl_probs, src_enc_len)
+          per_layer_attn_probs.append(norma_atten_probs_3d)
 
-      self._AddAttenProbsSummary(source_paddings, targets, atten_probs)
+      # per_layer_attn_probs shape: [batch, trg time, src time]
+      self._AddAttenProbsSummary(source_paddings, targets, per_layer_attn_probs)
 
-      return layer_out
+      # Aggregate per-layer attention probs.
+      aggregated_atten_probs = (
+          tf.math.add_n(per_layer_attn_probs) / len(per_layer_attn_probs))
+
+      attention_map = py_utils.NestedMap(probs=aggregated_atten_probs)
+      return py_utils.NestedMap(
+          softmax_input=layer_out, attention=attention_map)
 
   def ExtendStep(self, theta, encoder_outputs, new_ids, t, prefix_states):
     """Extend prefix as represented by `prefix_states` by one more step.
@@ -979,9 +1100,11 @@ class TransformerDecoder(MTBaseDecoder):
         been decoded.
 
     Returns:
-      A pair (last_decoder_out, prefix_states), where last_decoder_out is the
-      output of the last decoder layer of shape [batch, model_dim], and
-      `prefix_states` is the update prefix states.
+      A tuple (last_decoder_out, prefix_states, atten_probs), where
+      last_decoder_out is the output of the last decoder layer of
+      shape [batch, model_dim], `prefix_states` is the update prefix states,
+      and atten_probs contains attention in shape [batch, src_len] for the
+      given target position.
     """
     p = self.params
     source_paddings = encoder_outputs.padding
@@ -1013,17 +1136,44 @@ class TransformerDecoder(MTBaseDecoder):
       out_prefix_states = prefix_states.Pack(prefix_states.Flatten())
 
       layer_in = input_embs
+
+      # Infer num_hyps_per_beam: new_ids has orig_batch_size * num_hyps_per_beam
+      # source_paddings has orig_batch_size.
+      num_hyps_per_beam = tf.div(
+          py_utils.GetShape(new_ids)[0],
+          py_utils.GetShape(source_paddings)[1])
+
+      # Infer true source encoder length from the padding.
+      src_enc_len = tf.reduce_sum(1 - source_paddings, axis=0)
+
+      # Need to expand src_enc_len to reflect multiple hypotheses.
+      src_enc_len = self._ExpandToNumHyps(src_enc_len, num_hyps_per_beam)
+
+      atten_probs = []
       for i, (layer, layer_theta) in enumerate(zip(self.trans, theta.trans)):
         # [time, batch, model_dim]
         layer_prefix_states = prefix_states['layer_%i' % i]
-        layer_out, _, updated_prefix_states = layer.ExtendStep(
+        layer_out, probs, updated_prefix_states = layer.ExtendStep(
             layer_theta, layer_in, layer_prefix_states, source_encs[i],
             source_paddings,
             t if p.beam_search.name == 'tpu_beam_search' else None)
         out_prefix_states['layer_%i' % i] = updated_prefix_states
         layer_in = layer_out
 
-      return layer_out, out_prefix_states
+        # Enforce shape: [batch, src_len]
+        probs = tf.squeeze(probs)
+
+        # Remove attention weight on last (EOS) token and re-normalize
+        # so that last dimension sums to 1. See b/129097156.
+        probs_3d = tf.expand_dims(probs, axis=1)
+        probs_3d = self._RemoveEOSProbs(p, probs_3d, src_enc_len)
+        probs = tf.squeeze(probs_3d, axis=1)
+
+        atten_probs.append(probs)
+
+      # Aggregate per-layer attention probs.
+      aggregated_atten_probs = tf.math.add_n(atten_probs) / len(atten_probs)
+      return layer_out, out_prefix_states, aggregated_atten_probs
 
   def ComputePredictions(self, theta, encoder_outputs, targets):
     """Decodes `targets` given encoded source.
@@ -1042,7 +1192,10 @@ class TransformerDecoder(MTBaseDecoder):
         predict. Each tensor in targets is of shape [batch, time].
 
     Returns:
-      A Tensor with shape [time, batch, params.softmax.input_dim].
+      A `.NestedMap` containing utput of last decoder layer and attention probs:
+        softmax_input: Tensor of shape [time, batch, params.softmax.input_dim].
+        attention: `.NestedMap` of attention distributions of shape
+        [batch, time, source_len].
     """
     return self._FProp(theta, encoder_outputs, targets)
 
@@ -1092,7 +1245,7 @@ class TransformerDecoder(MTBaseDecoder):
       seq_len = 0
 
     prefix_states = py_utils.NestedMap({
-        'layer_%d' % layer: py_utils.NestedMap({
+        'layer_%d' % layer: py_utils.NestedMap({  # pylint:disable=g-complex-comprehension
             'key':
                 tf.zeros([seq_len, batch_size, atten_hidden_dim],
                          dtype=py_utils.FPropDtype(p)),
@@ -1142,10 +1295,9 @@ class TransformerDecoder(MTBaseDecoder):
 
     new_states = states.Pack(states.Flatten())
 
-    layer_out, updated_prefix_states = self.ExtendStep(theta, encoder_outputs,
-                                                       tf.squeeze(step_ids, 1),
-                                                       target_time,
-                                                       prefix_states)
+    layer_out, updated_prefix_states, atten_probs = self.ExtendStep(
+        theta, encoder_outputs, tf.squeeze(step_ids, 1), target_time,
+        prefix_states)
 
     new_states.prefix_states = updated_prefix_states
     new_states.time_step = target_time + 1
@@ -1154,16 +1306,10 @@ class TransformerDecoder(MTBaseDecoder):
     logits = self.softmax.Logits(theta.softmax, [softmax_input])
 
     num_hyps = py_utils.GetShape(step_ids)[0]
-    source_len = py_utils.GetShape(encoder_outputs.padding)[0]
     # [time * batch, num_classes] -> [time, batch, num_classes]
     logits = tf.reshape(logits, (-1, num_hyps, p.softmax.num_classes))
     # [time, batch, num_classes] -> [batch, time, num_classes]
     logits = tf.transpose(logits, (1, 0, 2))
-
-    # Dummy attention probs
-    atten_probs = (
-        tf.ones([num_hyps, source_len], dtype=py_utils.FPropDtype(p)) /
-        tf.cast(source_len, py_utils.FPropDtype(p)))
 
     # Only return logits for the last ids
     log_probs = tf.nn.log_softmax(tf.squeeze(logits, axis=1))
@@ -1185,3 +1331,120 @@ class TransformerDecoder(MTBaseDecoder):
         self.theta, encoder_outputs, num_hyps_per_beam_override,
         self._InitBeamSearchStateCallback, self._PreBeamSearchStepCallback,
         self._PostBeamSearchStepCallback)
+
+  def _AddAttenProbsScalarSummary(self, source_paddings, targets, atten_probs):
+    """Add scalar summary of multi-headed transformer attention probs.
+
+    This summary is primarily used to show statistics of the multi-headed
+    attention that reveals potential sparsity related properties. The
+    multi-headed attention probability tensors are exposed by
+    `MultiHeadedAttention.ComputeContextVectorWithSource` with the name
+    `multi_headed_atten_prob`. The following statistics are summarized:
+
+    - 1_v_2: margin of the largest value vs. the 2nd largest
+    - 1_v_3: similar, but vs the 3rd largest
+    - mean: mean of the attention probs. NOTE: the sequences in a mini-batch
+        are not always of the same length. The attention probability for the
+        padded time index in target sequences are removed. However, the padding
+        for the source sequences are left unchanged. As a result, the atten
+        probs vectors will have some extra zero entries, so the mean calculated
+        here will be smaller than the true mean.
+    - source_padding_ratio: as explained above, the source paddings are not
+        handled when computing the mean. This summary show the average ratio
+        of time-steps that are padded values in the source sequences, to give
+        a reference of roughly how much the mean summarized above should be
+        adjusted.
+    - 1_v_mean: margin of the largest value vs the mean value.
+    - sum: the sum of the attention prob vectors. Should always be 1, for sanity
+        check only.
+
+    The quantity above are computed for each sequence in the mini-batch, each
+    valid (target) sequence index, and each attention head, and then the
+    average value is reported to the tensorboard as a scalar summary.
+
+    Args:
+      source_paddings: source padding, of shape [src_len, src_batch].
+      targets: A dict of string to tensors representing the targets one try to
+        predict. Each tensor in targets is of shape [tgt_batch, tgt_len].
+      atten_probs: a list of attention probs, each element is of shape [tgt_len,
+        tgt_batch, src_len].
+    """
+    default_graph = tf.get_default_graph()
+    # looks like fprop/wmt14_en_de_transformer/tower_0_0/dec
+    name_scope = default_graph.get_name_scope()
+    # NOTE: shapes
+    # source_paddings: [src_len, src_batch]
+    # targets.paddings: [tgt_batch, tgt_len].
+    source_time = tf.shape(source_paddings)[0]
+    source_batch = tf.shape(source_paddings)[1]
+    target_time = tf.shape(targets.paddings)[1]
+    target_batch = tf.shape(targets.paddings)[0]
+    num_heads = self.trans[0].self_atten.params.num_attention_heads
+    with tf.control_dependencies([tf.assert_equal(source_batch, target_batch)]):
+      target_batch = tf.identity(target_batch)
+
+    source_padding_ratio = tf.cast(
+        tf.reduce_sum(source_paddings, axis=0), tf.float32)
+    source_padding_ratio /= tf.cast(tf.shape(source_paddings)[0], tf.float32)
+    summary_utils.scalar('source_padding_ratio',
+                         tf.reduce_mean(source_padding_ratio))
+
+    for i in range(len(atten_probs)):
+      suffix = '_{}'.format(i) if i > 0 else ''
+      # Tensor exported from MultiHeadedAttention.ComputeContextVectorWithSource
+      # shape [target_time * batch_size, num_heads, source_time]
+      try:
+        mha_probs = default_graph.get_tensor_by_name(
+            name_scope + ('/aux_atten{}/MultiHeadedAttention/'
+                          'ComputeContextVectorWithSource/'
+                          'multi_headed_atten_prob:0').format(suffix))
+      except KeyError:
+        # no such tensor found, stop here
+        return
+
+      mha_probs = tf.reshape(
+          mha_probs, (target_time, target_batch, num_heads, source_time))
+
+      # remove time padding from target_time
+      # (tgt_t, batch, n_heads, src_t) => (n_valid, n_heads, src_t)
+      # explicit reshape is used here to give masks static ndims, otherwise
+      # tf.boolean_mask will fail
+      masks = tf.reshape(
+          tf.equal(targets.paddings, 0), (target_time, target_batch))
+      mha_probs = tf.boolean_mask(mha_probs, masks)
+
+      # note we did not remove invalid entries according to source_paddings,
+      # because the result will no longer be a rectangular tensor, just
+      # remember when interpreting some statistics like mean, there are some
+      # padded zero entries due to non-uniform sequence lengths
+
+      # (n_valid, n_heads, src_t) => (n_valid*n_heads, src_t)
+      mha_probs = tf.reshape(mha_probs, (-1, tf.shape(mha_probs)[-1]))
+
+      probs_top3, _ = tf.math.top_k(mha_probs, k=3)
+      probs_mean = tf.math.reduce_mean(mha_probs, axis=1)
+      probs_sum = tf.math.reduce_sum(mha_probs, axis=1)  # sanity check
+
+      margins_12 = tf.reduce_mean(probs_top3[:, 0] - probs_top3[:, 1])
+      margins_13 = tf.reduce_mean(probs_top3[:, 0] - probs_top3[:, 2])
+      margins_1m = tf.reduce_mean(probs_top3[:, 0] - probs_mean)
+      summary_utils.scalar('1_v_2/atten{}'.format(i), margins_12)
+      summary_utils.scalar('1_v_3/atten{}'.format(i), margins_13)
+      summary_utils.scalar('1_v_mean/atten{}'.format(i), margins_1m)
+      summary_utils.scalar('mean/atten{}'.format(i), tf.reduce_mean(probs_mean))
+      summary_utils.scalar('sum/atten{}'.format(i), tf.reduce_mean(probs_sum))
+
+  def _AddAttenProbsSummary(self, source_paddings, targets, atten_probs):
+    """Add summary of attention probs.
+
+    Args:
+      source_paddings: source padding, of shape [src_len, src_batch].
+      targets: A dict of string to tensors representing the targets one try to
+        predict. Each tensor in targets is of shape [tgt_batch, tgt_len].
+      atten_probs: a list of attention probs, each element is of shape [tgt_len,
+        tgt_batch, src_len].
+    """
+    super(TransformerDecoder,
+          self)._AddAttenProbsSummary(source_paddings, targets, atten_probs)
+    if self.cluster.add_summary and self.params.add_multiheaded_attention_scalar_summary:
+      self._AddAttenProbsScalarSummary(source_paddings, targets, atten_probs)

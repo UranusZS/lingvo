@@ -66,6 +66,46 @@ cc_library(
         executable = False,
     )
 
+def _absl_includes_repo_impl(repo_ctx):
+    tf_include_path = _find_tf_include_path(repo_ctx)
+    repo_ctx.symlink(
+        tf_include_path + "/external/com_google_absl",
+        "com_google_absl",
+    )
+    repo_ctx.file(
+        "BUILD",
+        content = """
+cc_library(
+    name = "includes",
+    hdrs = glob(["com_google_absl/absl/**/*.h",
+                 "com_google_absl/absl/**/*.inc"]),
+    includes = ["com_google_absl"],
+    visibility = ["//visibility:public"],
+)
+""",
+        executable = False,
+    )
+
+def _protobuf_includes_repo_impl(repo_ctx):
+    tf_include_path = _find_tf_include_path(repo_ctx)
+    repo_ctx.symlink(
+        tf_include_path + "/external/protobuf_archive/src",
+        "protobuf_archive",
+    )
+    repo_ctx.file(
+        "BUILD",
+        content = """
+cc_library(
+    name = "includes",
+    hdrs = glob(["protobuf_archive/**/*.h",
+                 "protobuf_archive/**/*.inc"]),
+    includes = ["protobuf_archive"],
+    visibility = ["//visibility:public"],
+)
+""",
+        executable = False,
+    )
+
 def _tensorflow_includes_repo_impl(repo_ctx):
     tf_include_path = _find_tf_include_path(repo_ctx)
     repo_ctx.symlink(tf_include_path, "tensorflow_includes")
@@ -77,7 +117,9 @@ cc_library(
     hdrs = glob(["tensorflow_includes/**/*.h",
                  "tensorflow_includes/third_party/eigen3/**"]),
     includes = ["tensorflow_includes"],
-    deps = ["@eigen_archive//:includes"],
+    deps = ["@absl_includes//:includes",
+            "@eigen_archive//:includes",
+            "@protobuf_archive//:includes",],
     visibility = ["//visibility:public"],
 )
 """,
@@ -92,7 +134,7 @@ def _tensorflow_solib_repo_impl(repo_ctx):
         content = """
 cc_library(
     name = "framework_lib",
-    srcs = ["tensorflow_solib/libtensorflow_framework.so"],
+    srcs = ["tensorflow_solib/libtensorflow_framework.so.1"],
     visibility = ["//visibility:public"],
 )
 """,
@@ -106,6 +148,14 @@ def cc_tf_configure():
         implementation = _nsync_includes_repo_impl,
     )
     make_nsync_repo(name = "nsync_includes")
+    make_absl_repo = repository_rule(
+        implementation = _absl_includes_repo_impl,
+    )
+    make_absl_repo(name = "absl_includes")
+    make_protobuf_repo = repository_rule(
+        implementation = _protobuf_includes_repo_impl,
+    )
+    make_protobuf_repo(name = "protobuf_archive")
     make_tfinc_repo = repository_rule(
         implementation = _tensorflow_includes_repo_impl,
     )
@@ -116,7 +166,7 @@ def cc_tf_configure():
     make_tflib_repo(name = "tensorflow_solib")
 
 def lingvo_testonly_deps():
-    if "com_google_googletest" not in native.existing_rules():
+    if not native.existing_rule("com_google_googletest"):
         http_archive(
             name = "com_google_googletest",
             build_file_content = """
@@ -169,7 +219,7 @@ filegroup(
 )
 """,
         urls = [
-            "https://github.com/google/protobuf/releases/download/v3.6.1/protoc-3.6.1-linux-x86_64.zip",
+            "https://github.com/protocolbuffers/protobuf/releases/download/v3.7.1/protoc-3.7.1-linux-x86_64.zip",
         ],
-        sha256 = "6003de742ea3fcf703cfec1cd4a3380fd143081a2eb0e559065563496af27807",
+        sha256 = "24ea6924faaf94d4a0c5850fdb278290a326eff9a68f36ee5809654faccd0e10",
     )
